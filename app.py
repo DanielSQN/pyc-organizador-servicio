@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import copy
+from datetime import datetime
 from io import BytesIO
 from textwrap import dedent
 
@@ -1124,6 +1125,8 @@ def build_schedule_matrix(schedule_df: pd.DataFrame) -> pd.DataFrame:
 def show_schedule_matrix(
     schedule_df: pd.DataFrame,
     people_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None = None,
     supervisor_config: dict[str, dict[str, str]] | None = None,
 ) -> None:
     """Muestra una vista amable para coordinar posiciones por turno."""
@@ -1138,15 +1141,195 @@ def show_schedule_matrix(
         with tab:
             supervisor, asistente = _show_zone_supervisor_controls(zone, supervisor_config, all_people)
 
-            matrix_df = build_schedule_matrix(schedule_df[schedule_df["Zona"] == zone])
-            matrix_df = matrix_df.drop(columns=["Zona"])
+            zone_schedule_df = schedule_df[schedule_df["Zona"] == zone]
+            _show_editable_zone_matrix(zone, zone_schedule_df, available_df, turnos_por_grupo)
 
-            st.dataframe(
-                matrix_df.style.map(_style_matrix_cell),
-                width="stretch",
-                hide_index=True,
-                column_config=_matrix_column_config(),
+
+def _show_editable_zone_matrix(
+    zone: str,
+    zone_schedule_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None,
+) -> None:
+    edit_key = f"editing_zone_{zone}"
+    if not st.session_state.get(edit_key, False):
+        if st.button(f"Editar {zone}", key=f"edit_zone_{zone}", width="stretch"):
+            st.session_state[edit_key] = True
+            st.rerun()
+
+        matrix_df = build_schedule_matrix(zone_schedule_df).drop(columns=["Zona"])
+        st.dataframe(
+            matrix_df.style.map(_style_matrix_cell),
+            width="stretch",
+            hide_index=True,
+            column_config=_matrix_column_config(),
+        )
+        return
+
+    volunteer_options, volunteer_lookup = _manual_assignment_options(available_df)
+    editor_df = _editable_zone_matrix_df(zone_schedule_df)
+    turn_keys = [_turn_key(turno) for turno in sorted(TURNOS)]
+    row_key_columns = [f"_row_{turn_key}" for turn_key in turn_keys]
+
+    edited_df = st.data_editor(
+        editor_df,
+        width="stretch",
+        hide_index=True,
+        disabled=["Posición", "Tipo"],
+        column_config={
+            **{row_key: None for row_key in row_key_columns},
+            "Posición": st.column_config.TextColumn("Posición", width="medium"),
+            "Tipo": st.column_config.TextColumn("Tipo", width="small"),
+            **{
+                turn_key: st.column_config.SelectboxColumn(
+                    _turn_header(turno),
+                    options=volunteer_options,
+                    required=True,
+                    width="medium",
+                )
+                for turno, turn_key in ((_turno, _turn_key(_turno)) for _turno in sorted(TURNOS))
+            },
+        },
+        key=f"editable_zone_matrix_{zone}",
+    )
+
+    if st.button(f"Guardar cambios {zone}", key=f"save_zone_changes_{zone}", width="stretch"):
+        updated_schedule, changed = _apply_zone_matrix_changes(
+            st.session_state["schedule_df"],
+            edited_df,
+            volunteer_lookup,
+            turnos_por_grupo,
+        )
+        if not changed:
+            st.info("No hubo cambios para aplicar.")
+            st.session_state[edit_key] = False
+            st.rerun()
+            return
+
+        st.session_state["schedule_df"] = updated_schedule
+        st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo)
+        st.session_state[edit_key] = False
+        st.success("Cambios aplicados. Alertas y programación actualizadas.")
+        st.rerun()
+
+
+def _editable_zone_matrix_df(zone_schedule_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    positions_order = get_positions_df().reset_index().rename(columns={"index": "_orden"})
+    zone_schedule_df = zone_schedule_df.copy()
+    zone_schedule_df["_schedule_index"] = zone_schedule_df.index
+    zone_schedule_df = zone_schedule_df.merge(
+        positions_order[["zona", "posicion", "_orden"]],
+        left_on=["Zona", "Posición"],
+        right_on=["zona", "posicion"],
+        how="left",
+    )
+    multi_slot_positions = _multi_slot_positions(zone_schedule_df)
+
+    grouped = zone_schedule_df.groupby(["Zona", "Posición", "Tipo", "Slot"], sort=False)
+    for (_, position, row_type, slot), group in grouped:
+        position_label = position
+        if (position, row_type) in multi_slot_positions:
+            position_label = f"{position} - Slot {int(slot)}"
+
+        row = {
+            "Posición": position_label,
+            "Tipo": row_type,
+            "_orden": group["_orden"].min(),
+            "_slot": int(slot),
+        }
+
+        for turno in sorted(TURNOS):
+            turn_key = _turn_key(turno)
+            match = group[group["Turno"] == turno]
+            if match.empty:
+                row[turn_key] = FREE_NAME
+                row[f"_row_{turn_key}"] = ""
+                continue
+
+            schedule_row = match.iloc[0]
+            row[turn_key] = _manual_assignment_label(schedule_row)
+            row[f"_row_{turn_key}"] = str(schedule_row["_schedule_index"])
+
+        rows.append(row)
+
+    matrix_df = pd.DataFrame(rows).sort_values(["_orden", "_slot"]).drop(columns=["_orden", "_slot"])
+    return matrix_df
+
+
+def _multi_slot_positions(zone_schedule_df: pd.DataFrame) -> set[tuple[str, str]]:
+    slot_counts = zone_schedule_df.groupby(["Posición", "Tipo"])["Slot"].nunique()
+    return {key for key, count in slot_counts.items() if count > 1}
+
+
+def _apply_zone_matrix_changes(
+    schedule_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+    volunteer_lookup: dict[str, pd.Series | str],
+    turnos_por_grupo: dict[str, list[int]] | None,
+) -> tuple[pd.DataFrame, bool]:
+    updated_df = schedule_df.copy()
+    changed = False
+
+    for _, row in edited_df.iterrows():
+        for turno in sorted(TURNOS):
+            turn_key = _turn_key(turno)
+            row_index = row.get(f"_row_{turn_key}", "")
+            if row_index == "":
+                continue
+
+            row_index = int(row_index)
+            selected_label = row[turn_key]
+            current_label = _manual_assignment_label(updated_df.loc[row_index])
+            if selected_label == current_label:
+                continue
+
+            updated_df = _apply_assignment_label(
+                updated_df,
+                row_index,
+                selected_label,
+                volunteer_lookup,
+                turnos_por_grupo=turnos_por_grupo,
             )
+            changed = True
+
+    return updated_df, changed
+
+
+def _apply_assignment_label(
+    schedule_df: pd.DataFrame,
+    row_index: int,
+    selected_label: str,
+    volunteer_lookup: dict[str, pd.Series | str],
+    turnos_por_grupo: dict[str, list[int]] | None,
+) -> pd.DataFrame:
+    selected = volunteer_lookup[selected_label]
+    updated_df = schedule_df.copy()
+
+    if isinstance(selected, str) and selected == UNASSIGNED_NAME:
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+            "",
+            UNASSIGNED_NAME,
+            "",
+            "",
+            "",
+            "",
+        ]
+        return updated_df
+
+    if isinstance(selected, str) and selected == FREE_NAME:
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+            "",
+            FREE_NAME,
+            "",
+            "",
+            "",
+            "",
+        ]
+        return updated_df
+
+    updated_df, _ = apply_manual_assignment(updated_df, row_index, selected, turnos_por_grupo)
+    return updated_df
 
 
 def _show_group_color_legend() -> None:
@@ -1490,14 +1673,13 @@ def show_schedule_results(
             st.download_button(
                 "Descargar Excel",
                 data=excel_bytes,
-                file_name="programacion_pyc.xlsx",
+                file_name=_download_file_name(),
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 width="stretch",
             )
 
         show_assignment_coverage(schedule_df, available_df)
-        show_schedule_matrix(schedule_df, people_df, supervisor_config)
-        show_manual_reassignment(schedule_df, available_df, turnos_por_grupo)
+        show_schedule_matrix(schedule_df, people_df, available_df, turnos_por_grupo, supervisor_config)
 
         with st.expander("Programación detallada", expanded=False):
             st.dataframe(schedule_df, width="stretch")
@@ -1521,6 +1703,10 @@ def _supervisor_config_from_state(
         zone_config["asistente"] = "" if asistente == "sin asignar" else asistente
     st.session_state["supervisor_config"] = config
     return config
+
+
+def _download_file_name() -> str:
+    return f"programacion_pyc_{datetime.now():%Y_%m}.xlsx"
 
 
 def main() -> None:
