@@ -129,25 +129,41 @@ def validate_volunteers(df: pd.DataFrame) -> list[str]:
 
 
 def get_available_volunteers(df: pd.DataFrame) -> pd.DataFrame:
-    """Filtra personas con estados disponibles."""
+    """Filtra personas disponibles para asignar a posiciones."""
     clean_df = clean_volunteers(df)
-    return clean_df[clean_df["Estado"].isin(ESTADOS_DISPONIBLES)].reset_index(drop=True)
+    assignable = clean_df[
+        clean_df["Estado"].isin(ESTADOS_DISPONIBLES)
+        & (~clean_df["Estado"].isin(ESTADOS_ZONA_FIJA))
+    ]
+    return assignable.reset_index(drop=True)
+
+
+def get_supervisor_volunteers(df: pd.DataFrame) -> pd.DataFrame:
+    """Filtra personas marcadas como supervisoras de zona en el Excel."""
+    clean_df = clean_volunteers(df)
+    return clean_df[clean_df["Estado"].isin(ESTADOS_ZONA_FIJA)].reset_index(drop=True)
 
 
 def get_unavailable_volunteers(df: pd.DataFrame) -> pd.DataFrame:
     """Filtra personas con estados no disponibles."""
     clean_df = clean_volunteers(df)
-    return clean_df[~clean_df["Estado"].isin(ESTADOS_DISPONIBLES)].reset_index(drop=True)
+    unavailable = clean_df[
+        (~clean_df["Estado"].isin(ESTADOS_DISPONIBLES))
+        & (~clean_df["Estado"].isin(ESTADOS_ZONA_FIJA))
+    ]
+    return unavailable.reset_index(drop=True)
 
 
 def get_summary(df: pd.DataFrame, available_df: pd.DataFrame) -> dict:
     """Calcula resumen operativo para la UI."""
     clean_df = clean_volunteers(df)
-    unavailable_df = clean_df[~clean_df["Estado"].isin(ESTADOS_DISPONIBLES)]
+    supervisor_df = get_supervisor_volunteers(clean_df)
+    unavailable_df = get_unavailable_volunteers(clean_df)
 
     return {
         "total_cargados": len(clean_df),
         "total_disponibles": len(available_df),
+        "total_supervisores": len(supervisor_df),
         "total_no_disponibles": len(unavailable_df),
         "hombres_disponibles": int((available_df["Género"] == "H").sum()),
         "mujeres_disponibles": int((available_df["Género"] == "M").sum()),

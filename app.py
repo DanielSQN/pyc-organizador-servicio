@@ -14,6 +14,7 @@ from src.loader import (
     clean_volunteers,
     get_available_volunteers,
     get_summary,
+    get_supervisor_volunteers,
     get_unavailable_volunteers,
     read_volunteers,
     validate_volunteers,
@@ -723,6 +724,7 @@ def show_summary_chips(summary: dict) -> None:
         <div class="pyc-volunteer-strip">
           <span class="pyc-volunteer-chip">Total <strong>{summary["total_cargados"]}</strong></span>
           <span class="pyc-volunteer-chip">Disponibles <strong>{summary["total_disponibles"]}</strong></span>
+          <span class="pyc-volunteer-chip">Supervisores <strong>{summary.get("total_supervisores", 0)}</strong></span>
           <span class="pyc-volunteer-chip">No disponibles <strong>{summary["total_no_disponibles"]}</strong></span>
           {group_chips}
           <span class="pyc-volunteer-chip">Hombres <strong>{summary["hombres_disponibles"]}</strong></span>
@@ -1141,13 +1143,20 @@ def show_schedule_matrix(
     supervisor_config = supervisor_config or SUPERVISORES_ZONA
     zones = _ordered_zones(schedule_df)
     all_people = _person_options(people_df)
+    supervisor_state_people = set(_person_options(people_df[people_df["Estado"].isin(ZONAS_CONFIGURADAS)]))
+    assistant_people_source = [person for person in all_people if person not in supervisor_state_people]
 
     _show_group_color_legend()
     tabs = st.tabs([_zone_tab_label(zone) for zone in zones])
 
     for tab, zone in zip(tabs, zones):
         with tab:
-            supervisor, asistente = _show_zone_supervisor_controls(zone, supervisor_config, all_people)
+            supervisor, asistente = _show_zone_supervisor_controls(
+                zone,
+                supervisor_config,
+                all_people,
+                assistant_people_source,
+            )
 
             zone_schedule_df = schedule_df[schedule_df["Zona"] == zone]
             _show_editable_zone_matrix(zone, zone_schedule_df, available_df, turnos_por_grupo)
@@ -1356,6 +1365,7 @@ def _show_zone_supervisor_controls(
     zone: str,
     supervisor_config: dict[str, dict[str, str]],
     all_people: list[str],
+    assistant_people_source: list[str],
 ) -> tuple[str, str]:
     config = supervisor_config.setdefault(zone, {"supervisor": "", "asistente": ""})
     supervisor_value = st.session_state.get(f"zone_supervisor_{zone}", config.get("supervisor", ""))
@@ -1373,7 +1383,7 @@ def _show_zone_supervisor_controls(
     }
     assistant_people = [
         person
-        for person in all_people
+        for person in assistant_people_source
         if person != supervisor_value and person not in selected_supervisors
     ]
     assistant_options = ["sin asignar", *assistant_people]
@@ -1807,12 +1817,13 @@ def main() -> None:
         if not validation_errors:
             clean_df = clean_volunteers(raw_df)
             available_df = get_available_volunteers(clean_df)
+            supervisor_df = get_supervisor_volunteers(clean_df)
             unavailable_df = get_unavailable_volunteers(clean_df)
             summary = get_summary(clean_df, available_df)
         else:
-            clean_df = available_df = unavailable_df = summary = None
+            clean_df = available_df = supervisor_df = unavailable_df = summary = None
     else:
-        raw_df = clean_df = available_df = unavailable_df = summary = validation_errors = None
+        raw_df = clean_df = available_df = supervisor_df = unavailable_df = summary = validation_errors = None
 
     max_step = 1
     if has_uploaded_file and not validation_errors:
@@ -1901,6 +1912,9 @@ def main() -> None:
 
     with st.expander("Voluntarios disponibles", expanded=False):
         st.dataframe(available_df, width="stretch")
+
+    with st.expander("Supervisores detectados", expanded=False):
+        st.dataframe(supervisor_df, width="stretch")
 
     with st.expander("Voluntarios no disponibles", expanded=False):
         st.dataframe(unavailable_df, width="stretch")

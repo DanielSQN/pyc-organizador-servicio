@@ -61,6 +61,7 @@ def generate_schedule(
 ) -> tuple[pd.DataFrame, list[str]]:
     """Genera una programacion basica con reglas deterministicas."""
     volunteers = volunteers_df.copy().reset_index(drop=True)
+    volunteers = volunteers[~volunteers["Estado"].isin(ESTADOS_ZONA_FIJA)].reset_index(drop=True)
     volunteers["_id"] = volunteers.index
     turnos_por_grupo = turnos_por_grupo or TURNOS_POR_GRUPO
 
