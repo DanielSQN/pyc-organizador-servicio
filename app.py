@@ -545,7 +545,7 @@ def _write_formatted_schedule_sheet(
 def apply_report_styles(ws) -> None:
     """Aplica estilos de reporte operativo a la hoja de programación."""
     ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "B6"
+    ws.freeze_panes = None
     metadata_col = ws.max_column if _has_type_metadata(ws) else None
     last_col = metadata_col - 1 if metadata_col else ws.max_column
     if metadata_col:
