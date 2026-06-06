@@ -12,12 +12,12 @@ TURNOS = {
     4: "1330-1500",
 }
 
-TURNOS_REFUERZO_OBLIGATORIOS = [2, 3]
-
 TURNOS_POR_GRUPO = {
     "A": [1, 2, 3],
     "B": [2, 3, 4],
 }
+
+GRUPO_PRIMER_SERVICIO_DEFAULT = "A"
 
 SUPERVISORES_ZONA = {
     "Z1": {"supervisor": "KAREN GUERRERO", "asistente": ""},
@@ -42,11 +42,7 @@ def _position(
     cantidad: int = 1,
     regla_especial: str = "",
 ) -> dict:
-    turnos_obligatorios = (
-        sorted(TURNOS)
-        if tipo == "critica"
-        else [turno for turno in TURNOS_REFUERZO_OBLIGATORIOS if turno in TURNOS]
-    )
+    turnos_obligatorios = sorted(TURNOS) if tipo == "critica" else []
 
     return {
         "zona": zona,
@@ -102,10 +98,10 @@ POSICIONES = [
     _crit("Z2", "Ingreso Padres SPK 2piso"),
     _crit("Z2", "Rampa salida SPK 2 piso"),
     _ref("Z2", "Overflow salón 215 (refuerzo)"),
-    _ref("Z2", "Salida puerta de vidrio SPK", regla_especial="apoyo_evacuacion"),
-    _ref("Z2", "Escaleras eléctricas 1 piso", regla_especial="apoyo_evacuacion"),
-    _ref("Z2", "Escaleras eléctricas 2 piso", regla_especial="apoyo_evacuacion"),
-    _ref("Z2", "Escaleras capacitación 1P", regla_especial="apoyo_evacuacion"),
+    _ref("Z2", "Salida puerta vidrio SPK (apoyo)", regla_especial="apoyo_evacuacion"),
+    _ref("Z2", "Escaleras eléctricas 1 piso", "M", regla_especial="spk_evacuacion_1"),
+    _ref("Z2", "Escaleras eléctricas 2 piso", "M", regla_especial="spk_evacuacion_2"),
+    _ref("Z2", "Escaleras capacitación 1P", "M", regla_especial="spk_evacuacion_3"),
     _ref("Z2", "Escaleras capacitación 2P", regla_especial="apoyo_evacuacion"),
     _crit("Z3", "Ingreso lobby / puerta principal", regla_especial="ideal_h_m"),
     _ref("Z3", "Ingreso lobby / puerta (ref)", regla_especial="ideal_h_m"),
@@ -134,6 +130,23 @@ ESTADOS_VALIDOS = ESTADOS_DISPONIBLES + ESTADOS_NO_DISPONIBLES
 def get_positions_df() -> pd.DataFrame:
     """Devuelve el catalogo inicial de posiciones como DataFrame."""
     return pd.DataFrame(POSICIONES)
+
+
+def build_turnos_por_grupo(grupo_primer_servicio: str) -> dict[str, list[int]]:
+    """Calcula los turnos de cada grupo segun quien inicia el primer servicio."""
+    grupos = sorted(TURNOS_POR_GRUPO)
+    primer_grupo = str(grupo_primer_servicio or GRUPO_PRIMER_SERVICIO_DEFAULT).upper()
+    if primer_grupo not in grupos:
+        primer_grupo = GRUPO_PRIMER_SERVICIO_DEFAULT
+
+    if len(grupos) != 2:
+        return TURNOS_POR_GRUPO.copy()
+
+    segundo_grupo = next(grupo for grupo in grupos if grupo != primer_grupo)
+    return {
+        primer_grupo: [1, 2, 3],
+        segundo_grupo: [2, 3, 4],
+    }
 
 
 def get_required_slots() -> pd.DataFrame:

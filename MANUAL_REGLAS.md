@@ -199,7 +199,7 @@ pmu_luz_helena_pendiente
 Intenta asignar la posición `PMU - Radios chaquetas` a:
 
 ```text
-Luz Helena Roncancio
+Luz Helena Roncancio Garcia
 ```
 
 ### Auditorio SPK

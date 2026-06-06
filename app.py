@@ -17,8 +17,16 @@ from src.loader import (
     read_volunteers,
     validate_volunteers,
 )
-from src.rules import SUPERVISORES_ZONA, TITULOS_ZONA, TURNOS, get_positions_df
-from src.scheduler import FREE_NAME, UNASSIGNED_NAME, apply_manual_assignment, generate_schedule
+from src.rules import (
+    GRUPO_PRIMER_SERVICIO_DEFAULT,
+    SUPERVISORES_ZONA,
+    TITULOS_ZONA,
+    TURNOS,
+    ZONAS_CONFIGURADAS,
+    build_turnos_por_grupo,
+    get_positions_df,
+)
+from src.scheduler import FREE_NAME, UNASSIGNED_NAME, apply_manual_assignment, generate_schedule, validate_schedule
 
 
 COORDINADOR_NOMBRE = "FERNANDO BLANCO G."
@@ -358,6 +366,20 @@ def inject_app_styles() -> None:
             color: var(--pyc-ink) !important;
             margin-left: 0.25rem;
         }
+        .pyc-volunteer-chip.pyc-group-chip-a {
+            background: #2563eb !important;
+            border-color: #2563eb !important;
+            color: #ffffff !important;
+        }
+        .pyc-volunteer-chip.pyc-group-chip-b {
+            background: #16a34a !important;
+            border-color: #16a34a !important;
+            color: #ffffff !important;
+        }
+        .pyc-volunteer-chip.pyc-group-chip-a strong,
+        .pyc-volunteer-chip.pyc-group-chip-b strong {
+            color: #ffffff !important;
+        }
         .pyc-file-chip-row {
             display: flex;
             align-items: center;
@@ -440,13 +462,14 @@ def build_output_excel(
     schedule_df: pd.DataFrame,
     alerts: list[str],
     available_df: pd.DataFrame,
+    supervisor_config: dict[str, dict[str, str]] | None = None,
 ) -> bytes:
     """Crea el Excel final en memoria con una vista operativa por zonas."""
     output = BytesIO()
     alerts_df = pd.DataFrame({"Alerta": alerts})
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        _write_formatted_schedule_sheet(writer, schedule_df)
+        _write_formatted_schedule_sheet(writer, schedule_df, supervisor_config or SUPERVISORES_ZONA)
         alerts_df.to_excel(writer, sheet_name="Alertas", index=False)
         available_df.to_excel(writer, sheet_name="Voluntarios Disponibles", index=False)
         apply_report_styles(writer.sheets["Programacion"])
@@ -455,7 +478,11 @@ def build_output_excel(
     return output.getvalue()
 
 
-def _write_formatted_schedule_sheet(writer: pd.ExcelWriter, schedule_df: pd.DataFrame) -> None:
+def _write_formatted_schedule_sheet(
+    writer: pd.ExcelWriter,
+    schedule_df: pd.DataFrame,
+    supervisor_config: dict[str, dict[str, str]],
+) -> None:
     workbook = writer.book
     worksheet = workbook.create_sheet("Programacion")
     writer.sheets["Programacion"] = worksheet
@@ -476,7 +503,7 @@ def _write_formatted_schedule_sheet(writer: pd.ExcelWriter, schedule_df: pd.Data
             continue
 
         matrix_df = build_schedule_matrix(zone_df).drop(columns=["Zona"])
-        supervisor_info = SUPERVISORES_ZONA.get(zone, {})
+        supervisor_info = supervisor_config.get(zone, {})
         supervisor = supervisor_info.get("supervisor", "")
         asistente = supervisor_info.get("asistente", "")
 
@@ -657,7 +684,7 @@ def _zone_fill(row_label: str) -> PatternFill:
 
 
 def _zone_from_title(row_label: str) -> str:
-    for zone in SUPERVISORES_ZONA:
+    for zone in ZONAS_CONFIGURADAS:
         if f"({zone})" in row_label or row_label.endswith(zone) or f" {zone} " in row_label:
             return zone
     return row_label.split()[-1] if row_label.split() else ""
@@ -908,11 +935,66 @@ def show_file_summary(uploaded_file, summary: dict, sheet_name: str, status: str
     show_summary_chips(summary)
 
 
-def generate_and_store_schedule(available_df: pd.DataFrame) -> None:
-    schedule_df, alerts = generate_schedule(available_df)
+def _person_full_name(row: pd.Series) -> str:
+    return f"{row['Nombre']} {row['Apellido']}".strip()
+
+
+def _person_options(df: pd.DataFrame) -> list[str]:
+    if df is None or df.empty:
+        return []
+    names = [_person_full_name(row) for _, row in df.iterrows()]
+    return sorted(dict.fromkeys(name for name in names if name))
+
+
+def build_supervisor_config(clean_df: pd.DataFrame) -> dict[str, dict[str, str]]:
+    supervisors_by_state = {
+        zone: _person_options(clean_df[clean_df["Estado"] == zone])
+        for zone in ZONAS_CONFIGURADAS
+    }
+
+    config: dict[str, dict[str, str]] = {}
+    for zone in ZONAS_CONFIGURADAS:
+        detected_supervisors = supervisors_by_state.get(zone, [])
+        config[zone] = {
+            "supervisor": detected_supervisors[0] if detected_supervisors else "",
+            "asistente": "",
+        }
+
+    return config
+
+
+def show_generation_settings() -> dict[str, list[int]]:
+    groups = sorted(build_turnos_por_grupo(GRUPO_PRIMER_SERVICIO_DEFAULT))
+    selected_first_group = st.selectbox(
+        "Grupo que inicia en el primer servicio",
+        options=groups,
+        index=groups.index(GRUPO_PRIMER_SERVICIO_DEFAULT) if GRUPO_PRIMER_SERVICIO_DEFAULT in groups else 0,
+        key="grupo_primer_servicio",
+    )
+    turnos_por_grupo = build_turnos_por_grupo(selected_first_group)
+
+    turnos_text = " | ".join(
+        f"Grupo {grupo}: T{', T'.join(str(turno) for turno in turnos)}"
+        for grupo, turnos in sorted(turnos_por_grupo.items())
+    )
+    st.caption(turnos_text)
+
+    return turnos_por_grupo
+
+
+def generate_and_store_schedule(
+    available_df: pd.DataFrame,
+    clean_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+) -> None:
+    supervisor_config = build_supervisor_config(clean_df)
+    schedule_df, alerts = generate_schedule(available_df, turnos_por_grupo)
     st.session_state["schedule_df"] = schedule_df
     st.session_state["alerts"] = alerts
     st.session_state["available_df"] = available_df
+    st.session_state["people_df"] = clean_df
+    st.session_state["turnos_por_grupo"] = turnos_por_grupo
+    st.session_state["supervisor_config"] = supervisor_config
 
 
 def show_alerts(alerts: list[str]) -> None:
@@ -1039,19 +1121,22 @@ def build_schedule_matrix(schedule_df: pd.DataFrame) -> pd.DataFrame:
     return matrix_df
 
 
-def show_schedule_matrix(schedule_df: pd.DataFrame) -> None:
+def show_schedule_matrix(
+    schedule_df: pd.DataFrame,
+    people_df: pd.DataFrame,
+    supervisor_config: dict[str, dict[str, str]] | None = None,
+) -> None:
     """Muestra una vista amable para coordinar posiciones por turno."""
+    supervisor_config = supervisor_config or SUPERVISORES_ZONA
     zones = _ordered_zones(schedule_df)
+    all_people = _person_options(people_df)
+
+    _show_group_color_legend()
     tabs = st.tabs([_zone_tab_label(zone) for zone in zones])
 
     for tab, zone in zip(tabs, zones):
         with tab:
-            supervisor_info = SUPERVISORES_ZONA.get(zone, {})
-            supervisor = supervisor_info.get("supervisor", "")
-            asistente = supervisor_info.get("asistente", "")
-
-            st.markdown(f"**Zona {zone}**")
-            st.caption(f"Supervisor: {supervisor} | Asistente: {asistente or 'pendiente'}")
+            supervisor, asistente = _show_zone_supervisor_controls(zone, supervisor_config, all_people)
 
             matrix_df = build_schedule_matrix(schedule_df[schedule_df["Zona"] == zone])
             matrix_df = matrix_df.drop(columns=["Zona"])
@@ -1062,6 +1147,77 @@ def show_schedule_matrix(schedule_df: pd.DataFrame) -> None:
                 hide_index=True,
                 column_config=_matrix_column_config(),
             )
+
+
+def _show_group_color_legend() -> None:
+    st.markdown(
+        """
+        <div class="pyc-volunteer-strip">
+          <span class="pyc-volunteer-chip pyc-group-chip-a">Azul <strong>Grupo A</strong></span>
+          <span class="pyc-volunteer-chip pyc-group-chip-b">Verde <strong>Grupo B</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _show_zone_supervisor_controls(
+    zone: str,
+    supervisor_config: dict[str, dict[str, str]],
+    all_people: list[str],
+) -> tuple[str, str]:
+    config = supervisor_config.setdefault(zone, {"supervisor": "", "asistente": ""})
+    supervisor_value = st.session_state.get(f"zone_supervisor_{zone}", config.get("supervisor", ""))
+    assistant_value = st.session_state.get(f"zone_assistant_{zone}", config.get("asistente", ""))
+    supervisor_value = "" if supervisor_value == "sin asignar" else supervisor_value
+    assistant_value = "" if assistant_value == "sin asignar" else assistant_value
+
+    supervisor_options = ["sin asignar", *all_people]
+    supervisor_index = _option_index(supervisor_options, supervisor_value)
+
+    selected_supervisors = {
+        zone_config.get("supervisor", "")
+        for zone_config in supervisor_config.values()
+        if zone_config.get("supervisor")
+    }
+    assistant_people = [
+        person
+        for person in all_people
+        if person != supervisor_value and person not in selected_supervisors
+    ]
+    assistant_options = ["sin asignar", *assistant_people]
+    assistant_index = _option_index(assistant_options, assistant_value)
+
+    cols = st.columns([1.0, 1.0], gap="small")
+    with cols[0]:
+        supervisor = st.selectbox(
+            f"**Supervisor {zone}**",
+            options=supervisor_options,
+            index=supervisor_index,
+            key=f"zone_supervisor_{zone}",
+        )
+    with cols[1]:
+        asistente = st.selectbox(
+            f"**Asistente {zone}**",
+            options=assistant_options,
+            index=assistant_index,
+            key=f"zone_assistant_{zone}",
+        )
+
+    config["supervisor"] = "" if supervisor == "sin asignar" else supervisor
+    config["asistente"] = "" if asistente == "sin asignar" else asistente
+    st.session_state["supervisor_config"] = supervisor_config
+    return config["supervisor"], config["asistente"]
+
+
+def _option_index(options: list[str], value: str) -> int:
+    if value and value in options:
+        return options.index(value)
+    return 0
+
+
+def _display_person_or_unassigned(value: str) -> str:
+    return value if value else "sin asignar"
 
 
 def show_assignment_coverage(schedule_df: pd.DataFrame, available_df: pd.DataFrame) -> None:
@@ -1115,7 +1271,7 @@ def _format_assignment(row: pd.Series) -> str:
     full_name = f"{row['Nombre']} {row['Apellido']}".strip()
     tags = [row["Grupo"]]
 
-    if row["Estado"] in set(SUPERVISORES_ZONA) | {"apoyo"}:
+    if row["Estado"] in set(ZONAS_CONFIGURADAS) | {"apoyo"}:
         tags.append(row["Estado"])
 
     return f"{full_name} ({', '.join(tags)})"
@@ -1130,7 +1286,7 @@ def _turn_header(turno: int) -> str:
 
 
 def _ordered_zones(schedule_df: pd.DataFrame) -> list[str]:
-    configured_order = list(SUPERVISORES_ZONA)
+    configured_order = list(ZONAS_CONFIGURADAS)
     present_zones = list(dict.fromkeys(schedule_df["Zona"].astype(str)))
     ordered = [zone for zone in configured_order if zone in present_zones]
     ordered.extend(zone for zone in present_zones if zone not in ordered)
@@ -1170,42 +1326,139 @@ def _style_matrix_cell(value: object) -> str:
     if text == "refuerzo":
         return "background-color: #fff3cd; color: #8a5a00; font-weight: 700;"
 
+    has_group_a = "(A)" in text or "(A," in text
+    has_group_b = "(B)" in text or "(B," in text
+    if has_group_a and not has_group_b:
+        return "background-color: #dbeafe; color: #1e3a8a; font-weight: 700;"
+    if has_group_b and not has_group_a:
+        return "background-color: #dcfce7; color: #14532d; font-weight: 700;"
+    if has_group_a and has_group_b:
+        return "background-color: #ede9fe; color: #4c1d95; font-weight: 700;"
+
     if text.strip() and text not in {"Zona", "Posición", "Tipo"}:
         return "background-color: #d7e8f7; color: #1f3b63; font-weight: 650;"
 
     return ""
 
 
-def show_manual_reassignment(schedule_df: pd.DataFrame, available_df: pd.DataFrame) -> None:
+def show_manual_reassignment(
+    schedule_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None = None,
+) -> None:
     st.subheader("Reasignación manual")
 
-    with st.expander("Cambiar una asignación", expanded=False):
-        display_options = {
-            _slot_label(index, row): index for index, row in schedule_df.sort_values(
-                ["Turno", "Zona", "Posición", "Slot"]
-            ).iterrows()
-        }
-        selected_slot = st.selectbox("Posición a modificar", options=list(display_options.keys()))
+    with st.expander("Editar asignaciones", expanded=False):
+        volunteer_options, volunteer_lookup = _manual_assignment_options(available_df)
+        editor_df = _manual_editor_df(schedule_df)
+        editor_df["Asignacion manual"] = editor_df["_row_index"].apply(
+            lambda row_index: _manual_assignment_label(schedule_df.loc[row_index])
+        )
 
-        volunteer_options = {"SIN ASIGNAR": None}
-        for index, row in available_df.sort_values(["Grupo", "Nombre", "Apellido"]).iterrows():
-            label = (
-                f"{row['Nombre']} {row['Apellido']} "
-                f"({row['Grupo']} / {row['Género']} / {row['Estado']})"
+        edited_df = st.data_editor(
+            editor_df,
+            width="stretch",
+            hide_index=True,
+            disabled=["_row_index", "Zona", "Turno", "Horario", "Posición", "Slot", "Tipo", "Obligatorio"],
+            column_config={
+                "_row_index": None,
+                "Asignacion manual": st.column_config.SelectboxColumn(
+                    "Asignacion manual",
+                    options=volunteer_options,
+                    required=True,
+                    width="large",
+                ),
+            },
+            key="manual_assignment_editor",
+        )
+
+        if st.button("Aplicar cambios manuales", width="stretch"):
+            updated_schedule, changed = _apply_manual_editor_changes(
+                schedule_df,
+                edited_df,
+                volunteer_lookup,
+                turnos_por_grupo,
             )
-            volunteer_options[label] = index
+            if not changed:
+                st.info("No hubo cambios para aplicar.")
+                return
 
-        selected_volunteer = st.selectbox("Nuevo voluntario", options=list(volunteer_options.keys()))
-
-        if st.button("Aplicar reasignación"):
-            row_index = display_options[selected_slot]
-            volunteer_index = volunteer_options[selected_volunteer]
-            volunteer = None if volunteer_index is None else available_df.loc[volunteer_index]
-            updated_schedule, updated_alerts = apply_manual_assignment(schedule_df, row_index, volunteer)
             st.session_state["schedule_df"] = updated_schedule
-            st.session_state["alerts"] = updated_alerts
-            st.success("Reasignación aplicada. Alertas y programación actualizadas.")
+            st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo)
+            st.success("Cambios manuales aplicados. Alertas y programación actualizadas.")
             st.rerun()
+
+
+def _manual_editor_df(schedule_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Zona", "Turno", "Horario", "Posición", "Slot", "Tipo", "Obligatorio"]
+    editor_df = schedule_df.reset_index().rename(columns={"index": "_row_index"})
+    return editor_df[["_row_index", *columns]].sort_values(["Turno", "Zona", "Posición", "Slot"])
+
+
+def _manual_assignment_options(available_df: pd.DataFrame) -> tuple[list[str], dict[str, pd.Series | str]]:
+    options = [UNASSIGNED_NAME, FREE_NAME]
+    lookup: dict[str, pd.Series | str] = {
+        UNASSIGNED_NAME: UNASSIGNED_NAME,
+        FREE_NAME: FREE_NAME,
+    }
+
+    for _, row in available_df.sort_values(["Grupo", "Nombre", "Apellido"]).iterrows():
+        label = _manual_assignment_label(row)
+        options.append(label)
+        lookup[label] = row
+
+    return options, lookup
+
+
+def _manual_assignment_label(row: pd.Series) -> str:
+    if row["Nombre"] in {UNASSIGNED_NAME, FREE_NAME}:
+        return row["Nombre"]
+    return (
+        f"{row['Nombre']} {row['Apellido']} "
+        f"({row['Grupo']} / {row['Género']} / {row['Estado']})"
+    )
+
+
+def _apply_manual_editor_changes(
+    schedule_df: pd.DataFrame,
+    edited_df: pd.DataFrame,
+    volunteer_lookup: dict[str, pd.Series | str],
+    turnos_por_grupo: dict[str, list[int]] | None = None,
+) -> tuple[pd.DataFrame, bool]:
+    updated_df = schedule_df.copy()
+    changed = False
+
+    for _, row in edited_df.iterrows():
+        row_index = int(row["_row_index"])
+        selected_label = row["Asignacion manual"]
+        current_label = _manual_assignment_label(updated_df.loc[row_index])
+        if selected_label == current_label:
+            continue
+
+        selected = volunteer_lookup[selected_label]
+        if isinstance(selected, str) and selected == UNASSIGNED_NAME:
+            updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+                "",
+                UNASSIGNED_NAME,
+                "",
+                "",
+                "",
+                "",
+            ]
+        elif isinstance(selected, str) and selected == FREE_NAME:
+            updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+                "",
+                FREE_NAME,
+                "",
+                "",
+                "",
+                "",
+            ]
+        else:
+            updated_df, _ = apply_manual_assignment(updated_df, row_index, selected, turnos_por_grupo)
+        changed = True
+
+    return updated_df, changed
 
 
 def _slot_label(index: int, row: pd.Series) -> str:
@@ -1216,11 +1469,19 @@ def _slot_label(index: int, row: pd.Series) -> str:
     )
 
 
-def show_schedule_results(schedule_df: pd.DataFrame, alerts: list[str], available_df: pd.DataFrame) -> None:
+def show_schedule_results(
+    schedule_df: pd.DataFrame,
+    alerts: list[str],
+    available_df: pd.DataFrame,
+    people_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None = None,
+    supervisor_config: dict[str, dict[str, str]] | None = None,
+) -> None:
     center_col, right_col = st.columns([3.1, 0.9], gap="small")
 
     with center_col:
-        excel_bytes = build_output_excel(schedule_df, alerts, available_df)
+        supervisor_config = _supervisor_config_from_state(supervisor_config or SUPERVISORES_ZONA)
+        excel_bytes = build_output_excel(schedule_df, alerts, available_df, supervisor_config)
 
         title_col, download_col = st.columns([2.6, 0.7], gap="small")
         with title_col:
@@ -1235,13 +1496,31 @@ def show_schedule_results(schedule_df: pd.DataFrame, alerts: list[str], availabl
             )
 
         show_assignment_coverage(schedule_df, available_df)
-        show_schedule_matrix(schedule_df)
+        show_schedule_matrix(schedule_df, people_df, supervisor_config)
+        show_manual_reassignment(schedule_df, available_df, turnos_por_grupo)
 
         with st.expander("Programación detallada", expanded=False):
             st.dataframe(schedule_df, width="stretch")
 
     with right_col:
         show_alert_sidebar(alerts)
+
+
+def _supervisor_config_from_state(
+    supervisor_config: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    config = {
+        zone: values.copy()
+        for zone, values in supervisor_config.items()
+    }
+    for zone in ZONAS_CONFIGURADAS:
+        zone_config = config.setdefault(zone, {"supervisor": "", "asistente": ""})
+        supervisor = st.session_state.get(f"zone_supervisor_{zone}", zone_config.get("supervisor", ""))
+        asistente = st.session_state.get(f"zone_assistant_{zone}", zone_config.get("asistente", ""))
+        zone_config["supervisor"] = "" if supervisor == "sin asignar" else supervisor
+        zone_config["asistente"] = "" if asistente == "sin asignar" else asistente
+    st.session_state["supervisor_config"] = config
+    return config
 
 
 def main() -> None:
@@ -1334,6 +1613,9 @@ def main() -> None:
             st.session_state["schedule_df"],
             st.session_state["alerts"],
             st.session_state["available_df"],
+            st.session_state.get("people_df", st.session_state["available_df"]),
+            st.session_state.get("turnos_por_grupo"),
+            st.session_state.get("supervisor_config"),
         )
         return
 
@@ -1343,12 +1625,13 @@ def main() -> None:
         summary,
         uploaded_sheet_name or "Voluntarios",
     )
+    turnos_por_grupo = show_generation_settings()
     action_col, _ = st.columns([0.22, 0.78])
     with action_col:
         with st.form("generate_schedule_form"):
             generate_clicked = st.form_submit_button("Generar", type="primary", width="stretch")
     if generate_clicked:
-        generate_and_store_schedule(available_df)
+        generate_and_store_schedule(available_df, clean_df, turnos_por_grupo)
         st.query_params["step"] = "3"
         st.rerun()
 

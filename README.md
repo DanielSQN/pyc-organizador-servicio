@@ -237,7 +237,7 @@ Valores validos:
 - En los turnos 1 y 4, los refuerzos aparecen como opcionales y pueden quedar como `-- (Libre)` sin generar alerta.
 - `Auditorio SPK` asigna tres mujeres: grupo A en turnos 1 y 2, grupo B en turnos 3 y 4, manteniendo continuidad por slot cuando es posible.
 - `Auditorio SPK (refuerzo)` asigna una mujer del grupo B en turnos 2 y 3.
-- `PMU - Radios chaquetas` se reserva para `Luz Helena Roncancio`.
+- `PMU - Radios chaquetas` se reserva para `Luz Helena Roncancio Garcia`.
 - Se respeta grupo disponible por turno.
 - Se respeta genero requerido cuando la posicion lo define.
 - `Z1`, `Z2` y `Z3` solo se asignan a su zona correspondiente.
