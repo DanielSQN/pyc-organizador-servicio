@@ -51,6 +51,9 @@ OUTPUT_COLUMNS = [
     "Observaciones",
 ]
 
+_REQUIRED_SLOTS_CACHE: Optional[pd.DataFrame] = None
+_SLOT_LOOKUP_CACHE: Optional[dict[tuple[int, str, str, int], pd.Series]] = None
+
 
 def generate_schedule(
     volunteers_df: pd.DataFrame,
@@ -370,6 +373,8 @@ def _rebalance_schedule(
             if slot is None or _rebalance_should_skip_slot(slot):
                 continue
 
+            continuity_assignments = _continuity_assignments_from_schedule(updated, volunteers, turnos_por_grupo)
+
             filled = _fill_from_available_person(
                 updated,
                 row_index,
@@ -377,6 +382,7 @@ def _rebalance_schedule(
                 volunteers,
                 turnos_por_grupo,
                 alerts,
+                continuity_assignments,
                 fill_optional=not mandatory_only,
             )
             if filled:
@@ -413,6 +419,7 @@ def _fill_from_available_person(
     volunteers: pd.DataFrame,
     turnos_por_grupo: dict[str, list[int]],
     alerts: list[str],
+    continuity_assignments: dict[tuple[str, int], int],
     fill_optional: bool,
 ) -> bool:
     assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
@@ -425,7 +432,7 @@ def _fill_from_available_person(
     candidates = _apply_special_filters(
         candidates,
         slot,
-        _continuity_assignments_from_schedule(schedule_df, volunteers, turnos_por_grupo),
+        continuity_assignments,
         turnos_por_grupo,
     )
     candidates, repeated_zone = _apply_rebalance_zone_rule(candidates, slot, zones_by_person)
@@ -496,8 +503,9 @@ def _move_from_optional_refuerzo(
         return False
 
     compatible_donors = []
+    volunteer_lookup = _volunteer_lookup(volunteers)
     for donor_index, donor in donors.iterrows():
-        volunteer = _volunteer_for_schedule_row(volunteers, donor)
+        volunteer = _volunteer_for_schedule_row(volunteers, donor, volunteer_lookup)
         if volunteer is None:
             continue
         if not _person_matches_slot(volunteer, target_slot, turnos_por_grupo):
@@ -613,10 +621,11 @@ def _assignment_state(
     assigned_by_turn: dict[int, set[int]] = defaultdict(set)
     zones_by_person: dict[int, list[str]] = defaultdict(list)
     assigned_turns_by_person: dict[int, set[int]] = defaultdict(set)
+    volunteer_lookup = _volunteer_lookup(volunteers)
 
     assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
     for _, row in assigned.iterrows():
-        volunteer = _volunteer_for_schedule_row(volunteers, row)
+        volunteer = _volunteer_for_schedule_row(volunteers, row, volunteer_lookup)
         if volunteer is None:
             continue
         person_id = int(volunteer["_id"])
@@ -634,12 +643,13 @@ def _continuity_assignments_from_schedule(
     turnos_por_grupo: dict[str, list[int]],
 ) -> dict[tuple[str, int], int]:
     continuity_assignments: dict[tuple[str, int], int] = {}
+    volunteer_lookup = _volunteer_lookup(volunteers)
     assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
     for _, row in assigned.iterrows():
         rule = _slot_rule_for_schedule_row(row)
         if rule not in {"spk_base", "spk_refuerzo"}:
             continue
-        volunteer = _volunteer_for_schedule_row(volunteers, row)
+        volunteer = _volunteer_for_schedule_row(volunteers, row, volunteer_lookup)
         if volunteer is None:
             continue
         slot = _slot_for_schedule_row(row)
@@ -650,16 +660,14 @@ def _continuity_assignments_from_schedule(
 
 
 def _slot_for_schedule_row(row: pd.Series) -> Optional[pd.Series]:
-    required_slots = get_required_slots()
-    match = required_slots[
-        (required_slots["turno"] == int(row["Turno"]))
-        & (required_slots["zona"] == row["Zona"])
-        & (required_slots["posicion"] == row["Posición"])
-        & (required_slots["slot_numero"] == int(row["Slot"]))
-    ]
-    if match.empty:
-        return None
-    return match.iloc[0]
+    return _slot_lookup().get(
+        (
+            int(row["Turno"]),
+            str(row["Zona"]),
+            str(row["Posición"]),
+            int(row["Slot"]),
+        )
+    )
 
 
 def _slot_rule_for_schedule_row(row: pd.Series) -> Optional[str]:
@@ -669,15 +677,42 @@ def _slot_rule_for_schedule_row(row: pd.Series) -> Optional[str]:
     return str(slot["regla_especial"])
 
 
-def _volunteer_for_schedule_row(volunteers: pd.DataFrame, row: pd.Series) -> Optional[pd.Series]:
-    match = volunteers[
-        (volunteers["Grupo"] == row["Grupo"])
-        & (volunteers["Nombre"] == row["Nombre"])
-        & (volunteers["Apellido"] == row["Apellido"])
-    ]
-    if match.empty:
-        return None
-    return match.iloc[0]
+def _volunteer_for_schedule_row(
+    volunteers: pd.DataFrame,
+    row: pd.Series,
+    lookup: Optional[dict[tuple[str, str, str], pd.Series]] = None,
+) -> Optional[pd.Series]:
+    lookup = lookup or _volunteer_lookup(volunteers)
+    return lookup.get((str(row["Grupo"]), str(row["Nombre"]), str(row["Apellido"])))
+
+
+def _required_slots_cached() -> pd.DataFrame:
+    global _REQUIRED_SLOTS_CACHE
+    if _REQUIRED_SLOTS_CACHE is None:
+        _REQUIRED_SLOTS_CACHE = get_required_slots()
+    return _REQUIRED_SLOTS_CACHE
+
+
+def _slot_lookup() -> dict[tuple[int, str, str, int], pd.Series]:
+    global _SLOT_LOOKUP_CACHE
+    if _SLOT_LOOKUP_CACHE is None:
+        _SLOT_LOOKUP_CACHE = {
+            (
+                int(row["turno"]),
+                str(row["zona"]),
+                str(row["posicion"]),
+                int(row["slot_numero"]),
+            ): row
+            for _, row in _required_slots_cached().iterrows()
+        }
+    return _SLOT_LOOKUP_CACHE
+
+
+def _volunteer_lookup(volunteers: pd.DataFrame) -> dict[tuple[str, str, str], pd.Series]:
+    return {
+        (str(row["Grupo"]), str(row["Nombre"]), str(row["Apellido"])): row
+        for _, row in volunteers.iterrows()
+    }
 
 
 def _person_matches_slot(
@@ -941,6 +976,9 @@ def _coverage_alerts(
     no_z1_people = []
     for _, volunteer in volunteers.iterrows():
         person = f"{volunteer['Nombre']} {volunteer['Apellido']}".strip()
+        if person.lower() == PMU_FIXED_NAME.lower():
+            continue
+
         expected_turns = set(turnos_por_grupo.get(str(volunteer["Grupo"]), []))
         person_rows = assigned[
             (assigned["Grupo"] == volunteer["Grupo"])
@@ -963,7 +1001,8 @@ def _coverage_alerts(
             "Ver Cobertura por voluntario para decidir ajustes manuales."
         )
 
-    z1_capacity = len(get_required_slots()[get_required_slots()["zona"] == "Z1"])
+    required_slots = _required_slots_cached()
+    z1_capacity = len(required_slots[required_slots["zona"] == "Z1"])
     if no_z1_people:
         if len(volunteers) > z1_capacity:
             reason = f"Z1 tiene {z1_capacity} cupos únicos y hay {len(volunteers)} voluntarios disponibles"
@@ -1130,7 +1169,7 @@ def apply_manual_assignment(
 
 
 def _required_gender_for_row(row: pd.Series) -> str:
-    required_slots = get_required_slots()
+    required_slots = _required_slots_cached()
     match = required_slots[
         (required_slots["turno"] == row["Turno"])
         & (required_slots["zona"] == row["Zona"])

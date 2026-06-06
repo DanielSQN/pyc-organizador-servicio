@@ -28,7 +28,14 @@ from src.rules import (
     build_turnos_por_grupo,
     get_positions_df,
 )
-from src.scheduler import FREE_NAME, UNASSIGNED_NAME, apply_manual_assignment, generate_schedule, validate_schedule
+from src.scheduler import (
+    FREE_NAME,
+    PMU_FIXED_NAME,
+    UNASSIGNED_NAME,
+    apply_manual_assignment,
+    generate_schedule,
+    validate_schedule,
+)
 
 
 COORDINADOR_NOMBRE = "FERNANDO BLANCO G."
@@ -1409,7 +1416,7 @@ def show_assignment_coverage(
     available_df: pd.DataFrame,
     turnos_por_grupo: dict[str, list[int]] | None = None,
 ) -> None:
-    """Muestra cobertura de voluntarios y casos que requieren revision."""
+    """Muestra resumen de uso de voluntarios."""
     turnos_por_grupo = turnos_por_grupo or TURNOS_POR_GRUPO
     assigned_people = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])][
         ["Grupo", "Nombre", "Apellido"]
@@ -1450,14 +1457,19 @@ def show_assignment_coverage(
             else:
                 st.dataframe(unused_df, width="stretch", hide_index=True)
 
+def show_coverage_review(
+    schedule_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None = None,
+) -> None:
+    """Muestra una tabla plegable con voluntarios que no completan sus turnos."""
+    turnos_por_grupo = turnos_por_grupo or TURNOS_POR_GRUPO
     coverage_df = _coverage_by_volunteer(schedule_df, available_df, turnos_por_grupo)
-    review_df = coverage_df[
-        (coverage_df["Turnos faltantes"] != "")
-        | (coverage_df["Paso por Z1"] == "No")
-    ]
-    with st.popover(f"Cobertura por voluntario: {len(review_df)} por revisar", width="stretch"):
+    review_df = coverage_df[coverage_df["Turnos faltantes"] != ""]
+
+    with st.expander(f"Cobertura por voluntario: {len(review_df)} con turnos faltantes", expanded=False):
         if review_df.empty:
-            st.success("Todos tienen sus turnos esperados y al menos un paso por Z1.")
+            st.success("Todos los voluntarios revisables tienen sus turnos esperados.")
         else:
             st.dataframe(review_df, width="stretch", hide_index=True)
 
@@ -1477,6 +1489,9 @@ def _coverage_by_volunteer(
     rows = []
     for _, volunteer in available_df.sort_values(["Grupo", "Nombre", "Apellido"]).iterrows():
         person = f"{volunteer['Nombre']} {volunteer['Apellido']}".strip()
+        if person.lower() == PMU_FIXED_NAME.lower():
+            continue
+
         expected = sorted(turnos_por_grupo.get(str(volunteer["Grupo"]), []))
         person_rows = assigned[
             (assigned["Grupo"] == volunteer["Grupo"])
@@ -1734,6 +1749,7 @@ def show_schedule_results(
 
         show_assignment_coverage(schedule_df, available_df, turnos_por_grupo)
         show_schedule_matrix(schedule_df, people_df, available_df, turnos_por_grupo, supervisor_config)
+        show_coverage_review(schedule_df, available_df, turnos_por_grupo)
 
         with st.expander("Programación detallada", expanded=False):
             st.dataframe(schedule_df, width="stretch")
@@ -1871,7 +1887,15 @@ def main() -> None:
         with st.form("generate_schedule_form"):
             generate_clicked = st.form_submit_button("Generar", type="primary", width="stretch")
     if generate_clicked:
-        generate_and_store_schedule(available_df, clean_df, turnos_por_grupo)
+        with st.status("Generando programación...", expanded=True) as status:
+            st.write("Aplicando reglas, balanceando turnos y validando alertas.")
+            progress = st.progress(15, text="Preparando datos")
+            with st.spinner("Esto puede tardar unos segundos."):
+                progress.progress(45, text="Asignando posiciones")
+                generate_and_store_schedule(available_df, clean_df, turnos_por_grupo)
+                progress.progress(90, text="Validando cobertura")
+            progress.progress(100, text="Programación lista")
+            status.update(label="Programación generada", state="complete")
         st.query_params["step"] = "3"
         st.rerun()
 
