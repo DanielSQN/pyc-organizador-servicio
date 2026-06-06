@@ -23,6 +23,7 @@ from src.rules import (
     SUPERVISORES_ZONA,
     TITULOS_ZONA,
     TURNOS,
+    TURNOS_POR_GRUPO,
     ZONAS_CONFIGURADAS,
     build_turnos_por_grupo,
     get_positions_df,
@@ -1207,7 +1208,7 @@ def _show_editable_zone_matrix(
             return
 
         st.session_state["schedule_df"] = updated_schedule
-        st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo)
+        st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo, available_df)
         st.session_state[edit_key] = False
         st.success("Cambios aplicados. Alertas y programación actualizadas.")
         st.rerun()
@@ -1403,8 +1404,13 @@ def _display_person_or_unassigned(value: str) -> str:
     return value if value else "sin asignar"
 
 
-def show_assignment_coverage(schedule_df: pd.DataFrame, available_df: pd.DataFrame) -> None:
-    """Muestra que voluntarios disponibles quedaron sin uso en la programacion."""
+def show_assignment_coverage(
+    schedule_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]] | None = None,
+) -> None:
+    """Muestra cobertura de voluntarios y casos que requieren revision."""
+    turnos_por_grupo = turnos_por_grupo or TURNOS_POR_GRUPO
     assigned_people = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])][
         ["Grupo", "Nombre", "Apellido"]
     ].drop_duplicates()
@@ -1443,6 +1449,54 @@ def show_assignment_coverage(schedule_df: pd.DataFrame, available_df: pd.DataFra
                 st.success("Todos los voluntarios disponibles fueron asignados al menos una vez.")
             else:
                 st.dataframe(unused_df, width="stretch", hide_index=True)
+
+    coverage_df = _coverage_by_volunteer(schedule_df, available_df, turnos_por_grupo)
+    review_df = coverage_df[
+        (coverage_df["Turnos faltantes"] != "")
+        | (coverage_df["Paso por Z1"] == "No")
+    ]
+    with st.popover(f"Cobertura por voluntario: {len(review_df)} por revisar", width="stretch"):
+        if review_df.empty:
+            st.success("Todos tienen sus turnos esperados y al menos un paso por Z1.")
+        else:
+            st.dataframe(review_df, width="stretch", hide_index=True)
+
+
+def _coverage_by_volunteer(
+    schedule_df: pd.DataFrame,
+    available_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+) -> pd.DataFrame:
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])].copy()
+    assigned["Persona"] = (
+        assigned["Nombre"].astype(str).str.strip()
+        + " "
+        + assigned["Apellido"].astype(str).str.strip()
+    ).str.strip()
+
+    rows = []
+    for _, volunteer in available_df.sort_values(["Grupo", "Nombre", "Apellido"]).iterrows():
+        person = f"{volunteer['Nombre']} {volunteer['Apellido']}".strip()
+        expected = sorted(turnos_por_grupo.get(str(volunteer["Grupo"]), []))
+        person_rows = assigned[
+            (assigned["Grupo"] == volunteer["Grupo"])
+            & (assigned["Nombre"] == volunteer["Nombre"])
+            & (assigned["Apellido"] == volunteer["Apellido"])
+        ]
+        assigned_turns = sorted({int(turn) for turn in person_rows["Turno"].tolist()})
+        missing_turns = [turn for turn in expected if turn not in assigned_turns]
+        rows.append(
+            {
+                "Voluntario": person,
+                "Grupo": volunteer["Grupo"],
+                "Turnos esperados": ", ".join(f"T{turn}" for turn in expected),
+                "Turnos asignados": ", ".join(f"T{turn}" for turn in assigned_turns) or "Sin asignar",
+                "Turnos faltantes": ", ".join(f"T{turn}" for turn in missing_turns),
+                "Paso por Z1": "Si" if "Z1" in set(person_rows["Zona"].astype(str)) else "No",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def _format_assignment(row: pd.Series) -> str:
@@ -1567,7 +1621,7 @@ def show_manual_reassignment(
                 return
 
             st.session_state["schedule_df"] = updated_schedule
-            st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo)
+            st.session_state["alerts"] = validate_schedule(updated_schedule, turnos_por_grupo, available_df)
             st.success("Cambios manuales aplicados. Alertas y programación actualizadas.")
             st.rerun()
 
@@ -1678,7 +1732,7 @@ def show_schedule_results(
                 width="stretch",
             )
 
-        show_assignment_coverage(schedule_df, available_df)
+        show_assignment_coverage(schedule_df, available_df, turnos_por_grupo)
         show_schedule_matrix(schedule_df, people_df, available_df, turnos_por_grupo, supervisor_config)
 
         with st.expander("Programación detallada", expanded=False):

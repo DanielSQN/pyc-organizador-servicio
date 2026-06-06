@@ -118,6 +118,13 @@ def generate_schedule(
         ]
         repeated_zone = no_zone_repeat.empty
 
+        if repeated_zone and slot["zona"] == "Z1":
+            if bool(slot["obligatorio"]):
+                assignment_rows.append(_unassigned_row(slot))
+            else:
+                assignment_rows.append(_free_row(slot))
+            continue
+
         if not no_zone_repeat.empty:
             preferred = no_zone_repeat
 
@@ -127,7 +134,9 @@ def generate_schedule(
         assignment_rows.append(_assigned_row(slot, selected))
 
     schedule_df = pd.DataFrame(assignment_rows, columns=OUTPUT_COLUMNS)
-    alerts.extend(validate_schedule(schedule_df, turnos_por_grupo))
+    schedule_df, rebalance_alerts = _rebalance_schedule(schedule_df, volunteers, turnos_por_grupo)
+    alerts.extend(rebalance_alerts)
+    alerts.extend(validate_schedule(schedule_df, turnos_por_grupo, volunteers))
 
     return schedule_df, alerts
 
@@ -135,7 +144,7 @@ def generate_schedule(
 def _slot_order(slot: pd.Series) -> int:
     if slot["regla_especial"] == "pmu_luz_helena_pendiente":
         return -2
-    if slot["regla_especial"] == "spk_base":
+    if slot["regla_especial"] in {"spk_base", "spk_refuerzo"}:
         return -1
     if slot["tipo"] == "critica":
         return 0
@@ -327,9 +336,385 @@ def _track_assignment(
             _format_alert(
                 "ADVERTENCIA",
                 slot,
-                f"{volunteer['Nombre']} {volunteer['Apellido']} repitió zona por falta de alternativas",
+                (
+                    f"{volunteer['Nombre']} {volunteer['Apellido']} repitió {slot['zona']} "
+                    "porque no había otra persona compatible libre en ese turno"
+                ),
             )
         )
+
+
+def _rebalance_schedule(
+    schedule_df: pd.DataFrame,
+    volunteers: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+) -> tuple[pd.DataFrame, list[str]]:
+    """Hace una segunda pasada para cubrir huecos sin relajar las reglas duras."""
+    updated = schedule_df.copy().reset_index(drop=True)
+    alerts: list[str] = []
+
+    for mandatory_only in [True, False]:
+        target_names = {UNASSIGNED_NAME} if mandatory_only else {FREE_NAME}
+        candidate_rows = updated[updated["Nombre"].isin(target_names)].copy()
+        if candidate_rows.empty:
+            continue
+
+        candidate_rows["_orden"] = candidate_rows.apply(_rebalance_row_order, axis=1)
+        for row_index, row in candidate_rows.sort_values(
+            ["_orden", "Turno", "Zona", "Posición", "Slot"]
+        ).iterrows():
+            if updated.at[row_index, "Nombre"] not in target_names:
+                continue
+
+            slot = _slot_for_schedule_row(row)
+            if slot is None or _rebalance_should_skip_slot(slot):
+                continue
+
+            filled = _fill_from_available_person(
+                updated,
+                row_index,
+                slot,
+                volunteers,
+                turnos_por_grupo,
+                alerts,
+                fill_optional=not mandatory_only,
+            )
+            if filled:
+                continue
+
+            if mandatory_only:
+                _move_from_optional_refuerzo(
+                    updated,
+                    row_index,
+                    slot,
+                    volunteers,
+                    turnos_por_grupo,
+                    alerts,
+                )
+
+    return updated, alerts
+
+
+def _rebalance_row_order(row: pd.Series) -> int:
+    if bool(row.get("Obligatorio", False)):
+        return 0
+    return 1
+
+
+def _rebalance_should_skip_slot(slot: pd.Series) -> bool:
+    rule = str(slot["regla_especial"])
+    return rule in {"pmu_luz_helena_pendiente", *SPK_EVACUATION_RULES}
+
+
+def _fill_from_available_person(
+    schedule_df: pd.DataFrame,
+    row_index: int,
+    slot: pd.Series,
+    volunteers: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+    alerts: list[str],
+    fill_optional: bool,
+) -> bool:
+    assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
+    candidates = _compatible_candidates(
+        volunteers,
+        slot,
+        assigned_by_turn[int(slot["turno"])],
+        turnos_por_grupo,
+    )
+    candidates = _apply_special_filters(
+        candidates,
+        slot,
+        _continuity_assignments_from_schedule(schedule_df, volunteers, turnos_por_grupo),
+        turnos_por_grupo,
+    )
+    candidates, repeated_zone = _apply_rebalance_zone_rule(candidates, slot, zones_by_person)
+    if candidates.empty:
+        return False
+
+    if fill_optional:
+        candidates = candidates[
+            candidates.apply(
+                lambda person: len(assigned_turns_by_person[int(person["_id"])])
+                < len(turnos_por_grupo.get(str(person["Grupo"]), [])),
+                axis=1,
+            )
+        ]
+        if candidates.empty:
+            return False
+
+    selected = _select_rebalance_candidate(
+        candidates,
+        slot,
+        assigned_turns_by_person,
+        zones_by_person,
+        turnos_por_grupo,
+    )
+    _set_schedule_assignment(schedule_df, row_index, selected)
+
+    if repeated_zone and str(slot["zona"]) != "Z1":
+        alerts.append(
+            _format_alert(
+                "ADVERTENCIA",
+                schedule_df.loc[row_index],
+                (
+                    f"{selected['Nombre']} {selected['Apellido']} se asignó repitiendo {slot['zona']} "
+                    "para cubrir la posición; no había alternativa compatible sin repetir zona"
+                ),
+            )
+        )
+
+    return True
+
+
+def _move_from_optional_refuerzo(
+    schedule_df: pd.DataFrame,
+    target_index: int,
+    target_slot: pd.Series,
+    volunteers: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+    alerts: list[str],
+) -> bool:
+    if not bool(target_slot["obligatorio"]):
+        return False
+
+    assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
+    turno = int(target_slot["turno"])
+    donors = schedule_df[
+        (schedule_df["Turno"] == turno)
+        & (schedule_df["Tipo"] == "refuerzo")
+        & (~schedule_df["Obligatorio"].astype(bool))
+        & (~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME]))
+    ].copy()
+
+    if donors.empty:
+        return False
+
+    donors["_regla_especial"] = donors.apply(lambda row: str(_slot_rule_for_schedule_row(row) or ""), axis=1)
+    donors = donors[~donors["_regla_especial"].isin(ALLOWED_REPEAT_RULES)]
+    if donors.empty:
+        return False
+
+    compatible_donors = []
+    for donor_index, donor in donors.iterrows():
+        volunteer = _volunteer_for_schedule_row(volunteers, donor)
+        if volunteer is None:
+            continue
+        if not _person_matches_slot(volunteer, target_slot, turnos_por_grupo):
+            continue
+        repeated_target_zone = str(target_slot["zona"]) in zones_by_person[int(volunteer["_id"])]
+        if repeated_target_zone and str(target_slot["zona"]) == "Z1":
+            continue
+        compatible_donors.append((donor_index, donor, volunteer, repeated_target_zone))
+
+    if not compatible_donors:
+        return False
+
+    compatible_donors.sort(
+        key=lambda item: _rebalance_score(
+            item[2],
+            target_slot,
+            assigned_turns_by_person,
+            zones_by_person,
+            turnos_por_grupo,
+        )
+    )
+    donor_index, donor, volunteer, repeated_zone = compatible_donors[0]
+    _set_schedule_assignment(schedule_df, target_index, volunteer)
+    _set_schedule_free(schedule_df, donor_index)
+
+    alerts.append(
+        _format_alert(
+            "ADVERTENCIA",
+            schedule_df.loc[target_index],
+            (
+                f"{volunteer['Nombre']} {volunteer['Apellido']} se movió desde el refuerzo "
+                f"{donor['Zona']} / {donor['Posición']} para cubrir una posición obligatoria"
+            ),
+        )
+    )
+    if repeated_zone:
+        alerts.append(
+            _format_alert(
+                "ADVERTENCIA",
+                schedule_df.loc[target_index],
+                (
+                    f"{volunteer['Nombre']} {volunteer['Apellido']} repite {target_slot['zona']} "
+                    "porque no había alternativa compatible para la posición obligatoria"
+                ),
+            )
+        )
+
+    return True
+
+
+def _apply_rebalance_zone_rule(
+    candidates: pd.DataFrame,
+    slot: pd.Series,
+    zones_by_person: dict[int, list[str]],
+) -> tuple[pd.DataFrame, bool]:
+    if candidates.empty:
+        return candidates, False
+
+    no_zone_repeat = candidates[
+        ~candidates["_id"].apply(lambda person_id: str(slot["zona"]) in zones_by_person[int(person_id)])
+    ]
+    if not no_zone_repeat.empty:
+        return no_zone_repeat, False
+
+    if str(slot["zona"]) == "Z1":
+        return candidates.iloc[0:0], True
+
+    return candidates, True
+
+
+def _select_rebalance_candidate(
+    candidates: pd.DataFrame,
+    slot: pd.Series,
+    assigned_turns_by_person: dict[int, set[int]],
+    zones_by_person: dict[int, list[str]],
+    turnos_por_grupo: dict[str, list[int]],
+) -> pd.Series:
+    scored = candidates.copy()
+    scored["_rebalance_score"] = scored.apply(
+        lambda person: _rebalance_score(
+            person,
+            slot,
+            assigned_turns_by_person,
+            zones_by_person,
+            turnos_por_grupo,
+        ),
+        axis=1,
+    )
+    return scored.sort_values(["_rebalance_score", "Estado", "Grupo", "Nombre", "Apellido", "_id"]).iloc[0]
+
+
+def _rebalance_score(
+    person: pd.Series,
+    slot: pd.Series,
+    assigned_turns_by_person: dict[int, set[int]],
+    zones_by_person: dict[int, list[str]],
+    turnos_por_grupo: dict[str, list[int]],
+) -> tuple[int, int, int, int]:
+    person_id = int(person["_id"])
+    expected_turns = set(turnos_por_grupo.get(str(person["Grupo"]), []))
+    assigned_turns = assigned_turns_by_person[person_id]
+    missing_expected_turn = int(int(slot["turno"]) not in expected_turns - assigned_turns)
+    missing_turn_count = len(expected_turns - assigned_turns)
+    needs_z1 = int("Z1" in zones_by_person[person_id])
+    zone_repeats = zones_by_person[person_id].count(str(slot["zona"]))
+    return (missing_expected_turn, -missing_turn_count, needs_z1, zone_repeats)
+
+
+def _assignment_state(
+    schedule_df: pd.DataFrame,
+    volunteers: pd.DataFrame,
+) -> tuple[dict[int, set[int]], dict[int, list[str]], dict[int, set[int]]]:
+    assigned_by_turn: dict[int, set[int]] = defaultdict(set)
+    zones_by_person: dict[int, list[str]] = defaultdict(list)
+    assigned_turns_by_person: dict[int, set[int]] = defaultdict(set)
+
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
+    for _, row in assigned.iterrows():
+        volunteer = _volunteer_for_schedule_row(volunteers, row)
+        if volunteer is None:
+            continue
+        person_id = int(volunteer["_id"])
+        assigned_by_turn[int(row["Turno"])].add(person_id)
+        assigned_turns_by_person[person_id].add(int(row["Turno"]))
+        if not _is_allowed_evacuation_duplicate(row):
+            zones_by_person[person_id].append(str(row["Zona"]))
+
+    return assigned_by_turn, zones_by_person, assigned_turns_by_person
+
+
+def _continuity_assignments_from_schedule(
+    schedule_df: pd.DataFrame,
+    volunteers: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+) -> dict[tuple[str, int], int]:
+    continuity_assignments: dict[tuple[str, int], int] = {}
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
+    for _, row in assigned.iterrows():
+        rule = _slot_rule_for_schedule_row(row)
+        if rule not in {"spk_base", "spk_refuerzo"}:
+            continue
+        volunteer = _volunteer_for_schedule_row(volunteers, row)
+        if volunteer is None:
+            continue
+        slot = _slot_for_schedule_row(row)
+        if slot is None:
+            continue
+        continuity_assignments.setdefault(_continuity_key(slot, turnos_por_grupo), int(volunteer["_id"]))
+    return continuity_assignments
+
+
+def _slot_for_schedule_row(row: pd.Series) -> Optional[pd.Series]:
+    required_slots = get_required_slots()
+    match = required_slots[
+        (required_slots["turno"] == int(row["Turno"]))
+        & (required_slots["zona"] == row["Zona"])
+        & (required_slots["posicion"] == row["Posición"])
+        & (required_slots["slot_numero"] == int(row["Slot"]))
+    ]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def _slot_rule_for_schedule_row(row: pd.Series) -> Optional[str]:
+    slot = _slot_for_schedule_row(row)
+    if slot is None:
+        return None
+    return str(slot["regla_especial"])
+
+
+def _volunteer_for_schedule_row(volunteers: pd.DataFrame, row: pd.Series) -> Optional[pd.Series]:
+    match = volunteers[
+        (volunteers["Grupo"] == row["Grupo"])
+        & (volunteers["Nombre"] == row["Nombre"])
+        & (volunteers["Apellido"] == row["Apellido"])
+    ]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def _person_matches_slot(
+    volunteer: pd.Series,
+    slot: pd.Series,
+    turnos_por_grupo: dict[str, list[int]],
+) -> bool:
+    if int(slot["turno"]) not in turnos_por_grupo.get(str(volunteer["Grupo"]), []):
+        return False
+    if slot["genero_requerido"] != "cualquiera" and volunteer["Género"] != slot["genero_requerido"]:
+        return False
+    required_zone = ESTADOS_ZONA_FIJA.get(volunteer["Estado"], slot["zona"])
+    if required_zone != slot["zona"]:
+        return False
+    return True
+
+
+def _set_schedule_assignment(schedule_df: pd.DataFrame, row_index: int, volunteer: pd.Series) -> None:
+    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        volunteer["Grupo"],
+        volunteer["Nombre"],
+        volunteer["Apellido"],
+        volunteer["Género"],
+        volunteer["Estado"],
+        volunteer["Observaciones"],
+    ]
+
+
+def _set_schedule_free(schedule_df: pd.DataFrame, row_index: int) -> None:
+    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        "",
+        FREE_NAME,
+        "",
+        "",
+        "",
+        "",
+    ]
 
 
 def _assigned_row(slot: pd.Series, volunteer: pd.Series) -> dict:
@@ -389,6 +774,7 @@ def _free_row(slot: pd.Series) -> dict:
 def validate_schedule(
     schedule_df: pd.DataFrame,
     turnos_por_grupo: Optional[dict[str, list[int]]] = None,
+    volunteers_df: Optional[pd.DataFrame] = None,
 ) -> list[str]:
     """Valida una programacion generada o editada manualmente."""
     alerts: list[str] = []
@@ -404,7 +790,7 @@ def validate_schedule(
             _format_alert(
                 "SIN ASIGNAR",
                 row,
-                f"Requiere género {_gender_label(_required_gender_for_row(row))}",
+                _unassigned_alert_message(row, schedule_df, turnos_por_grupo, volunteers_df),
             )
         )
 
@@ -456,9 +842,146 @@ def validate_schedule(
                 )
             )
 
+    alerts.extend(_validate_z1_no_repeat(assigned))
     alerts.extend(_special_rule_validations(assigned, turnos_por_grupo))
+    if volunteers_df is not None:
+        alerts.extend(_coverage_alerts(schedule_df, volunteers_df, turnos_por_grupo))
 
     return alerts
+
+
+def _unassigned_alert_message(
+    row: pd.Series,
+    schedule_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+    volunteers_df: Optional[pd.DataFrame],
+) -> str:
+    required_gender = _gender_label(_required_gender_for_row(row))
+    base = f"Requiere género {required_gender}"
+    if volunteers_df is None:
+        return f"{base}. Revisar manualmente si hay una persona compatible disponible"
+
+    volunteers = volunteers_df.copy().reset_index(drop=True)
+    if "_id" not in volunteers:
+        volunteers["_id"] = volunteers.index
+
+    slot = _slot_for_schedule_row(row)
+    if slot is None:
+        return base
+
+    assigned_by_turn, zones_by_person, _ = _assignment_state(schedule_df, volunteers)
+    candidates = _compatible_candidates(
+        volunteers,
+        slot,
+        assigned_by_turn[int(row["Turno"])],
+        turnos_por_grupo,
+    )
+    candidates = _apply_special_filters(
+        candidates,
+        slot,
+        _continuity_assignments_from_schedule(schedule_df, volunteers, turnos_por_grupo),
+        turnos_por_grupo,
+    )
+    no_zone_repeat, repeated_zone = _apply_rebalance_zone_rule(candidates, slot, zones_by_person)
+
+    if not no_zone_repeat.empty:
+        return f"{base}. Hay {len(no_zone_repeat)} persona(s) compatible(s) libre(s); usar Editar para decidir"
+
+    if repeated_zone and str(row["Zona"]) == "Z1":
+        return f"{base}. No se cubre porque la única alternativa repetiría Z1, y Z1 no permite repetición"
+
+    if not candidates.empty:
+        return f"{base}. Solo hay alternativa repitiendo {row['Zona']}; el coordinador puede aprobarlo manualmente"
+
+    active_groups = ", ".join(
+        group for group, turns in sorted(turnos_por_grupo.items()) if int(row["Turno"]) in set(turns)
+    )
+    return (
+        f"{base}. No quedó persona compatible libre en este turno "
+        f"(grupos activos: {active_groups or 'sin grupo'}); revisar grupo inicial, apoyo adicional o edición manual"
+    )
+
+
+def _validate_z1_no_repeat(assigned: pd.DataFrame) -> list[str]:
+    alerts: list[str] = []
+    z1 = assigned[assigned["Zona"] == "Z1"]
+    if z1.empty:
+        return alerts
+
+    for person, group in z1.groupby("persona"):
+        if len(group) <= 1:
+            continue
+
+        first_row = group.sort_values(["Turno", "Posición"]).iloc[0]
+        alerts.append(
+            _format_alert(
+                "ERROR",
+                first_row,
+                f"{person} repite Z1 y en Z1 nadie debe repetir",
+            )
+        )
+
+    return alerts
+
+
+def _coverage_alerts(
+    schedule_df: pd.DataFrame,
+    volunteers_df: pd.DataFrame,
+    turnos_por_grupo: dict[str, list[int]],
+) -> list[str]:
+    volunteers = volunteers_df.copy()
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])].copy()
+    assigned["persona"] = (
+        assigned["Nombre"].astype(str).str.strip()
+        + " "
+        + assigned["Apellido"].astype(str).str.strip()
+    ).str.strip()
+
+    missing_people = []
+    no_z1_people = []
+    for _, volunteer in volunteers.iterrows():
+        person = f"{volunteer['Nombre']} {volunteer['Apellido']}".strip()
+        expected_turns = set(turnos_por_grupo.get(str(volunteer["Grupo"]), []))
+        person_rows = assigned[
+            (assigned["Grupo"] == volunteer["Grupo"])
+            & (assigned["Nombre"] == volunteer["Nombre"])
+            & (assigned["Apellido"] == volunteer["Apellido"])
+        ]
+        assigned_turns = set(person_rows["Turno"].astype(int).tolist())
+        missing_turns = sorted(expected_turns - assigned_turns)
+        if missing_turns:
+            missing_people.append(f"{person} ({', '.join(f'T{turn}' for turn in missing_turns)})")
+        if "Z1" not in set(person_rows["Zona"].astype(str)):
+            no_z1_people.append(person)
+
+    alerts: list[str] = []
+    if missing_people:
+        alerts.append(
+            "ADVERTENCIA: Cobertura - "
+            f"{len(missing_people)} voluntario(s) no completan sus turnos esperados. "
+            f"Primeros casos: {_short_people_list(missing_people)}. "
+            "Ver Cobertura por voluntario para decidir ajustes manuales."
+        )
+
+    z1_capacity = len(get_required_slots()[get_required_slots()["zona"] == "Z1"])
+    if no_z1_people:
+        if len(volunteers) > z1_capacity:
+            reason = f"Z1 tiene {z1_capacity} cupos únicos y hay {len(volunteers)} voluntarios disponibles"
+        else:
+            reason = "no hubo cupo compatible por turno, género o zona fija"
+        alerts.append(
+            "ADVERTENCIA: Cobertura Z1 - "
+            f"{len(no_z1_people)} voluntario(s) no pasan por Z1; {reason}. "
+            f"Primeros casos: {_short_people_list(no_z1_people)}."
+        )
+
+    return alerts
+
+
+def _short_people_list(people: list[str], limit: int = 4) -> str:
+    visible = people[:limit]
+    suffix = "" if len(people) <= limit else f" y {len(people) - limit} más"
+    return ", ".join(visible) + suffix
 
 
 def _special_rule_validations(
