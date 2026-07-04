@@ -33,8 +33,11 @@ ALLOWED_REPEAT_RULES = {
     "pmu_luz_helena_pendiente",
     "spk_base",
     "spk_refuerzo",
+    "mec_banos_base",
+    "mec_banos_refuerzo",
     *SPK_EVACUATION_RULES,
 }
+IDEAL_PAIR_RULE = "ideal_h_m"
 
 OUTPUT_COLUMNS = [
     "Turno",
@@ -49,6 +52,7 @@ OUTPUT_COLUMNS = [
     "Apellido",
     "Género",
     "Estado",
+    "Teléfono",
     "Observaciones",
 ]
 
@@ -80,6 +84,7 @@ def generate_schedule(
     assigned_by_turn: dict[int, set[int]] = defaultdict(set)
     zones_by_person: dict[int, list[str]] = defaultdict(list)
     continuity_assignments: dict[tuple[str, int], int] = {}
+    ideal_pair_gender: dict[int, str] = {}
     assignment_rows = []
     alerts: list[str] = []
 
@@ -110,7 +115,9 @@ def generate_schedule(
             assigned_by_turn[int(slot["turno"])],
             turnos_por_grupo,
         )
-        candidates = _apply_special_filters(candidates, slot, continuity_assignments, turnos_por_grupo)
+        candidates = _apply_special_filters(
+            candidates, slot, continuity_assignments, turnos_por_grupo, ideal_pair_gender
+        )
 
         if candidates.empty:
             if bool(slot["obligatorio"]):
@@ -140,6 +147,8 @@ def generate_schedule(
 
         selected = _pick_random_candidate(preferred, rng)
         _store_continuity_assignment(selected, slot, continuity_assignments, turnos_por_grupo)
+        if str(slot["regla_especial"]) == IDEAL_PAIR_RULE:
+            ideal_pair_gender.setdefault(int(slot["turno"]), str(selected["Género"]))
         _track_assignment(selected, slot, assigned_by_turn, zones_by_person, alerts, repeated_zone)
         assignment_rows.append(_assigned_row(slot, selected))
 
@@ -228,6 +237,7 @@ def _apply_special_filters(
     slot: pd.Series,
     continuity_assignments: dict[tuple[str, int], int],
     turnos_por_grupo: dict[str, list[int]],
+    ideal_pair_gender: Optional[dict[int, str]] = None,
 ) -> pd.DataFrame:
     if candidates.empty:
         return candidates
@@ -254,8 +264,29 @@ def _apply_special_filters(
         if continuity_key in continuity_assignments:
             return candidates[candidates["_id"] == continuity_assignments[continuity_key]]
 
+    if rule == "mec_banos_base":
+        required_group = _spk_group_for_turn(turno, turnos_por_grupo)
+        candidates = candidates[candidates["Grupo"] == required_group]
+
+        continuity_key = _continuity_key(slot, turnos_por_grupo)
+        if continuity_key in continuity_assignments:
+            return candidates[candidates["_id"] == continuity_assignments[continuity_key]]
+
+    if rule == "mec_banos_refuerzo":
+        continuity_key = _continuity_key(slot, turnos_por_grupo)
+        if continuity_key in continuity_assignments:
+            return candidates[candidates["_id"] == continuity_assignments[continuity_key]]
+
     if rule == "pmu_luz_helena_pendiente":
         return candidates[candidates.apply(lambda row: _full_name(row) == PMU_FIXED_NAME.lower(), axis=1)]
+
+    if rule == IDEAL_PAIR_RULE:
+        paired_gender = (ideal_pair_gender or {}).get(turno)
+        if paired_gender:
+            complementary_gender = "M" if paired_gender == "H" else "H"
+            complementary = candidates[candidates["Género"] == complementary_gender]
+            if not complementary.empty:
+                return complementary
 
     return candidates
 
@@ -268,7 +299,7 @@ def _continuity_key(
     turno = int(slot["turno"])
     slot_number = int(slot["slot_numero"])
 
-    if rule == "spk_base":
+    if rule in {"spk_base", "mec_banos_base"}:
         block = _spk_group_for_turn(turno, turnos_por_grupo or TURNOS_POR_GRUPO)
         return (f"{rule}_{block}", slot_number)
 
@@ -315,7 +346,7 @@ def _store_continuity_assignment(
     continuity_assignments: dict[tuple[str, int], int],
     turnos_por_grupo: dict[str, list[int]],
 ) -> None:
-    if slot["regla_especial"] not in {"spk_base", "spk_refuerzo"}:
+    if slot["regla_especial"] not in {"spk_base", "spk_refuerzo", "mec_banos_base", "mec_banos_refuerzo"}:
         return
 
     continuity_assignments.setdefault(_continuity_key(slot, turnos_por_grupo), int(volunteer["_id"]))
@@ -400,6 +431,7 @@ def _rebalance_schedule(
                 continue
 
             continuity_assignments = _continuity_assignments_from_schedule(updated, volunteers, turnos_por_grupo)
+            ideal_pair_gender = _ideal_pair_gender_from_schedule(updated)
 
             filled = _fill_from_available_person(
                 updated,
@@ -411,6 +443,7 @@ def _rebalance_schedule(
                 continuity_assignments,
                 fill_optional=not mandatory_only,
                 rng=rng,
+                ideal_pair_gender=ideal_pair_gender,
             )
             if filled:
                 continue
@@ -450,6 +483,7 @@ def _fill_from_available_person(
     continuity_assignments: dict[tuple[str, int], int],
     fill_optional: bool,
     rng: random.Random,
+    ideal_pair_gender: Optional[dict[int, str]] = None,
 ) -> bool:
     assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
     candidates = _compatible_candidates(
@@ -463,6 +497,7 @@ def _fill_from_available_person(
         slot,
         continuity_assignments,
         turnos_por_grupo,
+        ideal_pair_gender,
     )
     candidates, repeated_zone = _apply_rebalance_zone_rule(candidates, slot, zones_by_person)
     if candidates.empty:
@@ -504,6 +539,9 @@ def _fill_from_available_person(
     return True
 
 
+CONTINUITY_RULES = {"spk_base", "spk_refuerzo", "mec_banos_base", "mec_banos_refuerzo"}
+
+
 def _move_from_optional_refuerzo(
     schedule_df: pd.DataFrame,
     target_index: int,
@@ -514,6 +552,12 @@ def _move_from_optional_refuerzo(
     rng: random.Random,
 ) -> bool:
     if not bool(target_slot["obligatorio"]):
+        return False
+
+    if str(target_slot["regla_especial"]) in CONTINUITY_RULES:
+        # Un donante generico solo se valida con _person_matches_slot (grupo,
+        # genero, zona), sin aplicar la continuidad de estas reglas. Mover a
+        # cualquiera aqui rompería la continuidad exigida por la regla.
         return False
 
     assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
@@ -682,7 +726,7 @@ def _continuity_assignments_from_schedule(
     assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
     for _, row in assigned.iterrows():
         rule = _slot_rule_for_schedule_row(row)
-        if rule not in {"spk_base", "spk_refuerzo"}:
+        if rule not in {"spk_base", "spk_refuerzo", "mec_banos_base", "mec_banos_refuerzo"}:
             continue
         volunteer = _volunteer_for_schedule_row(volunteers, row, volunteer_lookup)
         if volunteer is None:
@@ -692,6 +736,16 @@ def _continuity_assignments_from_schedule(
             continue
         continuity_assignments.setdefault(_continuity_key(slot, turnos_por_grupo), int(volunteer["_id"]))
     return continuity_assignments
+
+
+def _ideal_pair_gender_from_schedule(schedule_df: pd.DataFrame) -> dict[int, str]:
+    ideal_pair_gender: dict[int, str] = {}
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])]
+    for _, row in assigned.iterrows():
+        if _slot_rule_for_schedule_row(row) != IDEAL_PAIR_RULE:
+            continue
+        ideal_pair_gender.setdefault(int(row["Turno"]), str(row["Género"]))
+    return ideal_pair_gender
 
 
 def _slot_for_schedule_row(row: pd.Series) -> Optional[pd.Series]:
@@ -715,10 +769,10 @@ def _slot_rule_for_schedule_row(row: pd.Series) -> Optional[str]:
 def _volunteer_for_schedule_row(
     volunteers: pd.DataFrame,
     row: pd.Series,
-    lookup: Optional[dict[tuple[str, str, str], pd.Series]] = None,
+    lookup: Optional[dict[tuple[str, str, str, str], pd.Series]] = None,
 ) -> Optional[pd.Series]:
     lookup = lookup or _volunteer_lookup(volunteers)
-    return lookup.get((str(row["Grupo"]), str(row["Nombre"]), str(row["Apellido"])))
+    return lookup.get(_volunteer_key(row))
 
 
 def _required_slots_cached() -> pd.DataFrame:
@@ -743,11 +797,22 @@ def _slot_lookup() -> dict[tuple[int, str, str, int], pd.Series]:
     return _SLOT_LOOKUP_CACHE
 
 
-def _volunteer_lookup(volunteers: pd.DataFrame) -> dict[tuple[str, str, str], pd.Series]:
-    return {
-        (str(row["Grupo"]), str(row["Nombre"]), str(row["Apellido"])): row
-        for _, row in volunteers.iterrows()
-    }
+def _volunteer_lookup(volunteers: pd.DataFrame) -> dict[tuple[str, str, str, str], pd.Series]:
+    return {_volunteer_key(row): row for _, row in volunteers.iterrows()}
+
+
+def _volunteer_key(row: pd.Series) -> tuple[str, str, str, str]:
+    """Identifica a un voluntario por grupo, nombre, apellido y teléfono.
+
+    Se incluye el teléfono para no confundir a dos personas que compartan
+    nombre y apellido dentro del mismo grupo (colisión real con nombres
+    comunes)."""
+    return (
+        str(row["Grupo"]),
+        str(row["Nombre"]),
+        str(row["Apellido"]),
+        str(row.get("Teléfono", "")),
+    )
 
 
 def _person_matches_slot(
@@ -766,20 +831,22 @@ def _person_matches_slot(
 
 
 def _set_schedule_assignment(schedule_df: pd.DataFrame, row_index: int, volunteer: pd.Series) -> None:
-    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
         volunteer["Grupo"],
         volunteer["Nombre"],
         volunteer["Apellido"],
         volunteer["Género"],
         volunteer["Estado"],
+        volunteer.get("Teléfono", ""),
         volunteer["Observaciones"],
     ]
 
 
 def _set_schedule_free(schedule_df: pd.DataFrame, row_index: int) -> None:
-    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+    schedule_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
         "",
         FREE_NAME,
+        "",
         "",
         "",
         "",
@@ -801,6 +868,7 @@ def _assigned_row(slot: pd.Series, volunteer: pd.Series) -> dict:
         "Apellido": volunteer["Apellido"],
         "Género": volunteer["Género"],
         "Estado": volunteer["Estado"],
+        "Teléfono": volunteer.get("Teléfono", ""),
         "Observaciones": volunteer["Observaciones"],
     }
 
@@ -819,6 +887,7 @@ def _unassigned_row(slot: pd.Series) -> dict:
         "Apellido": "",
         "Género": "",
         "Estado": "",
+        "Teléfono": "",
         "Observaciones": "",
     }
 
@@ -837,6 +906,7 @@ def _free_row(slot: pd.Series) -> dict:
         "Apellido": "",
         "Género": "",
         "Estado": "",
+        "Teléfono": "",
         "Observaciones": "",
     }
 
@@ -872,8 +942,9 @@ def validate_schedule(
         + " "
         + assigned["Apellido"].astype(str).str.strip()
     ).str.strip()
+    assigned["_persona_id"] = assigned.apply(_persona_id, axis=1)
 
-    for (turno, persona), group in assigned.groupby(["Turno", "persona"]):
+    for (turno, persona_id), group in assigned.groupby(["Turno", "_persona_id"]):
         regular_assignments = group[~group.apply(_is_allowed_evacuation_duplicate, axis=1)]
         if len(regular_assignments) <= 1:
             continue
@@ -883,7 +954,7 @@ def validate_schedule(
             _format_alert(
                 "ERROR",
                 first_row,
-                f"{persona} fue asignado más de una vez en este turno",
+                f"{first_row['persona']} fue asignado más de una vez en este turno",
             )
         )
 
@@ -978,7 +1049,7 @@ def _validate_z1_no_repeat(assigned: pd.DataFrame) -> list[str]:
     if z1.empty:
         return alerts
 
-    for person, group in z1.groupby("persona"):
+    for _, group in z1.groupby("_persona_id"):
         if len(group) <= 1:
             continue
 
@@ -987,7 +1058,7 @@ def _validate_z1_no_repeat(assigned: pd.DataFrame) -> list[str]:
             _format_alert(
                 "ERROR",
                 first_row,
-                f"{person} repite Z1 y en Z1 nadie debe repetir",
+                f"{first_row['persona']} repite Z1 y en Z1 nadie debe repetir",
             )
         )
 
@@ -1019,6 +1090,7 @@ def _coverage_alerts(
             (assigned["Grupo"] == volunteer["Grupo"])
             & (assigned["Nombre"] == volunteer["Nombre"])
             & (assigned["Apellido"] == volunteer["Apellido"])
+            & (assigned["Teléfono"].astype(str).str.strip() == str(volunteer.get("Teléfono", "")).strip())
         ]
         assigned_turns = set(person_rows["Turno"].astype(int).tolist())
         missing_turns = sorted(expected_turns - assigned_turns)
@@ -1182,21 +1254,23 @@ def apply_manual_assignment(
     updated_df = schedule_df.copy()
 
     if volunteer is None:
-        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
             "",
             UNASSIGNED_NAME,
             "",
             "",
             "",
             "",
+            "",
         ]
     else:
-        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
             volunteer["Grupo"],
             volunteer["Nombre"],
             volunteer["Apellido"],
             volunteer["Género"],
             volunteer["Estado"],
+            volunteer.get("Teléfono", ""),
             volunteer["Observaciones"],
         ]
 
@@ -1228,3 +1302,17 @@ def _gender_mismatch(row: pd.Series) -> bool:
 
 def _full_name(row: pd.Series) -> str:
     return f"{row['Nombre']} {row['Apellido']}".strip().lower()
+
+
+def _persona_id(row: pd.Series) -> str:
+    """Identifica a una persona ya asignada por grupo, nombre, apellido y
+    teléfono, para no confundir a dos voluntarios distintos que compartan
+    nombre y apellido en las validaciones (duplicados, repetición de Z1)."""
+    return "|".join(
+        [
+            str(row.get("Grupo", "")).strip(),
+            str(row.get("Nombre", "")).strip().lower(),
+            str(row.get("Apellido", "")).strip().lower(),
+            str(row.get("Teléfono", "")).strip(),
+        ]
+    )

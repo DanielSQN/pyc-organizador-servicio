@@ -237,6 +237,8 @@ Valores validos:
 - En los turnos 1 y 4, los refuerzos aparecen como opcionales y pueden quedar como `-- (Libre)` sin generar alerta.
 - `Auditorio SPK` asigna tres mujeres: grupo A en turnos 1 y 2, grupo B en turnos 3 y 4, manteniendo continuidad por slot cuando es posible.
 - `Auditorio SPK (refuerzo)` asigna una mujer del grupo B en turnos 2 y 3.
+- `MEC y baños auditorio` (M) y `MEC y baños (refuerzo)` (H) mantienen continuidad propia: la misma persona se conserva mientras su grupo trabaje esa posición.
+- `Ingreso lobby / puerta principal` y su refuerzo intentan (sin bloquear) que un turno quede con un hombre y una mujer.
 - `PMU - Radios chaquetas` se reserva para `Luz Helena Roncancio Garcia`.
 - Se respeta grupo disponible por turno.
 - Se respeta genero requerido cuando la posicion lo define.
@@ -246,7 +248,9 @@ Valores validos:
 - No se asigna la misma persona dos veces en el mismo turno.
 - Se evita repetir zona para una persona cuando existe alternativa.
 - Si no hay persona compatible, la posicion queda como `SIN ASIGNAR` y se genera alerta.
+- Entre varios candidatos igualmente validos para un cupo, el desempate se sortea en cada generación (con `seed` opcional para reproducirlo) para repartir las posiciones entre todos los hombres o mujeres compatibles.
 - El coordinador puede reasignar manualmente una fila de programacion y el sistema recalcula las alertas.
+- Se puede generar un enlace de WhatsApp (`wa.me`) por voluntario asignado, con su posición ya redactada en el mensaje.
 
 ## Salida
 
@@ -258,7 +262,7 @@ El Excel final contiene:
 
 ## Pendiente para proximas versiones
 
-- Rotacion avanzada.
 - Refuerzos opcionales en turnos 1 y 4 cuando sobre personal.
 - Generos pendientes por confirmar en posiciones ambiguas.
 - Priorizacion operativa mas detallada por experiencia, observaciones o restricciones adicionales.
+- Envío automático de WhatsApp (hoy requiere que el coordinador confirme el envío del enlace).

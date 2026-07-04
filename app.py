@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from copy import copy
 from datetime import datetime
 from io import BytesIO
 from textwrap import dedent
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -993,12 +995,36 @@ def show_generation_settings() -> dict[str, list[int]]:
     return turnos_por_grupo
 
 
+def _resolve_supervisor_config(clean_df: pd.DataFrame) -> dict[str, dict[str, str]]:
+    """Calcula la configuracion de supervisores/asistentes al generar.
+
+    Si ya existe una configuracion en la sesion (por ejemplo, porque el
+    coordinador ya habia elegido supervisores y volvio a generar la
+    programacion para ajustar algo), se conserva esa eleccion en vez de
+    recalcularla desde cero y perder los cambios manuales.
+    """
+    existing = st.session_state.get("supervisor_config")
+    defaults = build_supervisor_config(clean_df)
+    if not existing:
+        return defaults
+
+    resolved: dict[str, dict[str, str]] = {}
+    for zone in ZONAS_CONFIGURADAS:
+        existing_zone = existing.get(zone, {})
+        default_zone = defaults.get(zone, {"supervisor": "", "asistente": ""})
+        resolved[zone] = {
+            "supervisor": existing_zone.get("supervisor") or default_zone.get("supervisor", ""),
+            "asistente": existing_zone.get("asistente") or default_zone.get("asistente", ""),
+        }
+    return resolved
+
+
 def generate_and_store_schedule(
     available_df: pd.DataFrame,
     clean_df: pd.DataFrame,
     turnos_por_grupo: dict[str, list[int]],
 ) -> None:
-    supervisor_config = build_supervisor_config(clean_df)
+    supervisor_config = _resolve_supervisor_config(clean_df)
     schedule_df, alerts = generate_schedule(available_df, turnos_por_grupo)
     st.session_state["schedule_df"] = schedule_df
     st.session_state["alerts"] = alerts
@@ -1324,9 +1350,10 @@ def _apply_assignment_label(
     updated_df = schedule_df.copy()
 
     if isinstance(selected, str) and selected == UNASSIGNED_NAME:
-        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
             "",
             UNASSIGNED_NAME,
+            "",
             "",
             "",
             "",
@@ -1335,9 +1362,10 @@ def _apply_assignment_label(
         return updated_df
 
     if isinstance(selected, str) and selected == FREE_NAME:
-        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Observaciones"]] = [
+        updated_df.loc[row_index, ["Grupo", "Nombre", "Apellido", "Género", "Estado", "Teléfono", "Observaciones"]] = [
             "",
             FREE_NAME,
+            "",
             "",
             "",
             "",
@@ -1429,7 +1457,7 @@ def show_assignment_coverage(
     """Muestra resumen de uso de voluntarios."""
     turnos_por_grupo = turnos_por_grupo or TURNOS_POR_GRUPO
     assigned_people = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])][
-        ["Grupo", "Nombre", "Apellido"]
+        ["Grupo", "Nombre", "Apellido", "Teléfono"]
     ].drop_duplicates()
 
     available_keys = available_df.copy()
@@ -1442,6 +1470,8 @@ def show_assignment_coverage(
             + df["Nombre"].astype(str).str.strip()
             + "|"
             + df["Apellido"].astype(str).str.strip()
+            + "|"
+            + df["Teléfono"].astype(str).str.strip()
         )
 
     unused_df = available_keys[
@@ -1484,6 +1514,92 @@ def show_coverage_review(
             st.dataframe(review_df, width="stretch", hide_index=True)
 
 
+def _whatsapp_phone_digits(raw: str) -> str:
+    """Normaliza un telefono a solo digitos con indicativo de Colombia (57)."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if not digits:
+        return ""
+    if len(digits) == 10:
+        digits = f"57{digits}"
+    return digits
+
+
+def _whatsapp_link(phone_digits: str, message: str) -> str:
+    return f"https://wa.me/{phone_digits}?text={quote(message)}"
+
+
+def _whatsapp_message(persona: str, assignments: pd.DataFrame) -> str:
+    lines = [f"Hola {persona}, esta es tu posición para el servicio:"]
+    for _, row in assignments.sort_values(["Turno", "Zona", "Posición"]).iterrows():
+        lines.append(f"- T{int(row['Turno'])} ({row['Horario']}): {row['Zona']} · {row['Posición']}")
+    return "\n".join(lines)
+
+
+def _build_whatsapp_notifications(schedule_df: pd.DataFrame) -> pd.DataFrame:
+    assigned = schedule_df[~schedule_df["Nombre"].isin([UNASSIGNED_NAME, FREE_NAME])].copy()
+    assigned["Persona"] = (
+        assigned["Nombre"].astype(str).str.strip()
+        + " "
+        + assigned["Apellido"].astype(str).str.strip()
+    ).str.strip()
+    assigned["Teléfono"] = assigned.get("Teléfono", "").astype(str).str.strip()
+
+    rows = []
+    for (persona, telefono), group in assigned.groupby(["Persona", "Teléfono"], sort=False):
+        if persona.lower() == PMU_FIXED_NAME.lower():
+            continue
+
+        phone_digits = _whatsapp_phone_digits(telefono)
+        posiciones = " | ".join(
+            f"T{int(row['Turno'])} {row['Posición']}"
+            for _, row in group.sort_values(["Turno", "Zona", "Posición"]).iterrows()
+        )
+        rows.append(
+            {
+                "Voluntario": persona,
+                "Teléfono": telefono or "Sin registrar",
+                "Posiciones asignadas": posiciones,
+                "Enlace WhatsApp": _whatsapp_link(phone_digits, _whatsapp_message(persona, group))
+                if phone_digits
+                else "",
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("Voluntario") if rows else pd.DataFrame(
+        columns=["Voluntario", "Teléfono", "Posiciones asignadas", "Enlace WhatsApp"]
+    )
+
+
+def show_whatsapp_notifications(schedule_df: pd.DataFrame) -> None:
+    """Genera enlaces de WhatsApp (wa.me) para avisar a cada voluntario su posición."""
+    with st.expander("Notificar por WhatsApp", expanded=False):
+        notif_df = _build_whatsapp_notifications(schedule_df)
+        if notif_df.empty:
+            st.info("No hay voluntarios asignados todavía para notificar.")
+            return
+
+        missing_phone = notif_df[notif_df["Enlace WhatsApp"] == ""]
+        if not missing_phone.empty:
+            st.warning(
+                f"{len(missing_phone)} voluntario(s) sin teléfono registrado no se pueden notificar: "
+                + ", ".join(missing_phone["Voluntario"].tolist())
+            )
+
+        st.caption(
+            "Cada enlace abre WhatsApp con el mensaje ya redactado; solo falta presionar Enviar."
+        )
+        st.dataframe(
+            notif_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Enlace WhatsApp": st.column_config.LinkColumn(
+                    "Enlace WhatsApp", display_text="Abrir chat"
+                ),
+            },
+        )
+
+
 def _coverage_by_volunteer(
     schedule_df: pd.DataFrame,
     available_df: pd.DataFrame,
@@ -1507,6 +1623,7 @@ def _coverage_by_volunteer(
             (assigned["Grupo"] == volunteer["Grupo"])
             & (assigned["Nombre"] == volunteer["Nombre"])
             & (assigned["Apellido"] == volunteer["Apellido"])
+            & (assigned["Teléfono"].astype(str).str.strip() == str(volunteer.get("Teléfono", "")).strip())
         ]
         assigned_turns = sorted({int(turn) for turn in person_rows["Turno"].tolist()})
         missing_turns = [turn for turn in expected if turn not in assigned_turns]
@@ -1675,9 +1792,12 @@ def _manual_assignment_options(available_df: pd.DataFrame) -> tuple[list[str], d
 def _manual_assignment_label(row: pd.Series) -> str:
     if row["Nombre"] in {UNASSIGNED_NAME, FREE_NAME}:
         return row["Nombre"]
+
+    phone = str(row.get("Teléfono", "") or "").strip()
+    phone_suffix = f" · Tel {phone}" if phone else ""
     return (
         f"{row['Nombre']} {row['Apellido']} "
-        f"({row['Grupo']} / {row['Género']} / {row['Estado']})"
+        f"({row['Grupo']} / {row['Género']} / {row['Estado']}){phone_suffix}"
     )
 
 
@@ -1760,6 +1880,7 @@ def show_schedule_results(
         show_assignment_coverage(schedule_df, available_df, turnos_por_grupo)
         show_schedule_matrix(schedule_df, people_df, available_df, turnos_por_grupo, supervisor_config)
         show_coverage_review(schedule_df, available_df, turnos_por_grupo)
+        show_whatsapp_notifications(schedule_df)
 
         with st.expander("Programación detallada", expanded=False):
             st.dataframe(schedule_df, width="stretch")

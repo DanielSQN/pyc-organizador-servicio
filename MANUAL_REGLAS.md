@@ -238,6 +238,38 @@ Reglas actuales:
 - Requiere grupo B.
 - Mantiene continuidad entre T2 y T3.
 
+### MEC y baños auditorio / refuerzo
+
+Reglas:
+
+```python
+mec_banos_base
+mec_banos_refuerzo
+```
+
+Aplica a `MEC y baños auditorio` (M) y `MEC y baños (refuerzo)` (H).
+
+Reglas actuales:
+
+- Cada posición mantiene su propia continuidad (misma persona) mientras su
+  grupo trabaje esa posición: `mec_banos_base` sigue el mismo bloque de
+  turnos que `spk_base` (T1-T2 con el grupo que inicia, T3-T4 con el grupo
+  que termina); `mec_banos_refuerzo` mantiene continuidad entre T2 y T3.
+- No están vinculadas entre sí (géneros distintos).
+
+### Ingreso lobby / puerta principal y refuerzo
+
+Regla:
+
+```python
+ideal_h_m
+```
+
+Preferencia suave (no bloqueante): si ambas posiciones se cubren en el mismo
+turno, el sistema intenta asignar géneros distintos (un hombre y una mujer).
+Si no hay candidato del género complementario, se asigna igual sin generar
+error ni alerta.
+
 ## 8. Cómo agregar una nueva regla especial
 
 ### Paso 1: marcar la posición en `rules.py`

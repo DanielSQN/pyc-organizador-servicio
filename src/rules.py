@@ -17,6 +17,8 @@ TURNOS_POR_GRUPO = {
     "B": [2, 3, 4],
 }
 
+TURNOS_REFUERZO_OBLIGATORIOS = [2, 3]
+
 GRUPO_PRIMER_SERVICIO_DEFAULT = "A"
 
 SUPERVISORES_ZONA = {
@@ -42,7 +44,7 @@ def _position(
     cantidad: int = 1,
     regla_especial: str = "",
 ) -> dict:
-    turnos_obligatorios = sorted(TURNOS) if tipo == "critica" else []
+    turnos_obligatorios = sorted(TURNOS) if tipo == "critica" else sorted(TURNOS_REFUERZO_OBLIGATORIOS)
 
     return {
         "zona": zona,
