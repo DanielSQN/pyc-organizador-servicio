@@ -484,10 +484,39 @@ def build_output_excel(
         _write_formatted_schedule_sheet(writer, schedule_df, supervisor_config or SUPERVISORES_ZONA)
         alerts_df.to_excel(writer, sheet_name="Alertas", index=False)
         available_df.to_excel(writer, sheet_name="Voluntarios Disponibles", index=False)
+        _write_whatsapp_sheet(writer, schedule_df)
         apply_report_styles(writer.sheets["Programacion"])
 
     output.seek(0)
     return output.getvalue()
+
+
+def _write_whatsapp_sheet(writer: pd.ExcelWriter, schedule_df: pd.DataFrame) -> None:
+    """Agrega una hoja con los enlaces de WhatsApp como hipervinculo por voluntario."""
+    notif_df = _build_whatsapp_notifications(schedule_df)
+    link_column = "Enlace WhatsApp"
+    columns = ["Voluntario", "Teléfono", "Posiciones asignadas", link_column]
+
+    display_df = notif_df[["Voluntario", "Teléfono", "Posiciones asignadas"]].copy() if not notif_df.empty else pd.DataFrame(columns=columns[:-1])
+    display_df[link_column] = ""
+    display_df.to_excel(writer, sheet_name="WhatsApp", index=False)
+
+    worksheet = writer.sheets["WhatsApp"]
+    link_col_index = columns.index(link_column) + 1
+    hyperlink_font = Font(color="0563C1", underline="single")
+
+    for row_offset, (_, row) in enumerate(notif_df.iterrows(), start=2):
+        cell = worksheet.cell(row=row_offset, column=link_col_index)
+        link = row[link_column]
+        if link:
+            cell.value = "Abrir chat"
+            cell.hyperlink = link
+            cell.font = hyperlink_font
+        else:
+            cell.value = "Sin teléfono registrado"
+
+    worksheet.column_dimensions[get_column_letter(link_col_index)].width = 20
+    worksheet.column_dimensions[get_column_letter(columns.index("Posiciones asignadas") + 1)].width = 45
 
 
 def _write_formatted_schedule_sheet(
