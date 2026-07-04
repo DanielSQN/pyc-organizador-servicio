@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections import defaultdict
 from typing import Optional
 
@@ -58,8 +59,13 @@ _SLOT_LOOKUP_CACHE: Optional[dict[tuple[int, str, str, int], pd.Series]] = None
 def generate_schedule(
     volunteers_df: pd.DataFrame,
     turnos_por_grupo: Optional[dict[str, list[int]]] = None,
+    seed: Optional[int] = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Genera una programacion basica con reglas deterministicas."""
+    """Genera una programacion basica con reglas deterministicas, salvo el
+    desempate entre candidatos igualmente válidos para un mismo cupo, que se
+    sortea en cada ejecución para repartir las posiciones entre todos los
+    hombres o mujeres compatibles en vez de repetir siempre a la misma persona."""
+    rng = random.Random(seed)
     volunteers = volunteers_df.copy().reset_index(drop=True)
     volunteers = volunteers[~volunteers["Estado"].isin(ESTADOS_ZONA_FIJA)].reset_index(drop=True)
     volunteers["_id"] = volunteers.index
@@ -132,13 +138,13 @@ def generate_schedule(
         if not no_zone_repeat.empty:
             preferred = no_zone_repeat
 
-        selected = preferred.sort_values(["Estado", "Grupo", "Nombre", "Apellido", "_id"]).iloc[0]
+        selected = _pick_random_candidate(preferred, rng)
         _store_continuity_assignment(selected, slot, continuity_assignments, turnos_por_grupo)
         _track_assignment(selected, slot, assigned_by_turn, zones_by_person, alerts, repeated_zone)
         assignment_rows.append(_assigned_row(slot, selected))
 
     schedule_df = pd.DataFrame(assignment_rows, columns=OUTPUT_COLUMNS)
-    schedule_df, rebalance_alerts = _rebalance_schedule(schedule_df, volunteers, turnos_por_grupo)
+    schedule_df, rebalance_alerts = _rebalance_schedule(schedule_df, volunteers, turnos_por_grupo, rng)
     alerts.extend(rebalance_alerts)
     alerts.extend(validate_schedule(schedule_df, turnos_por_grupo, volunteers))
 
@@ -348,10 +354,29 @@ def _track_assignment(
         )
 
 
+def _pick_random_candidate(candidates: pd.DataFrame, rng: random.Random) -> pd.Series:
+    """Elige al azar entre los candidatos igualmente válidos para un cupo.
+
+    Reparte las posiciones entre todos los hombres o mujeres compatibles en
+    lugar de siempre escoger al mismo (antes se ordenaba por nombre y
+    apellido, lo que fijaba siempre a la misma persona en la misma posición).
+    """
+    index = rng.choice(list(candidates.index))
+    return candidates.loc[index]
+
+
+def _pick_best_by_score(items: list, score_fn, rng: random.Random):
+    scored = [(score_fn(item), item) for item in items]
+    best_score = min(score for score, _ in scored)
+    best_items = [item for score, item in scored if score == best_score]
+    return rng.choice(best_items)
+
+
 def _rebalance_schedule(
     schedule_df: pd.DataFrame,
     volunteers: pd.DataFrame,
     turnos_por_grupo: dict[str, list[int]],
+    rng: random.Random,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Hace una segunda pasada para cubrir huecos sin relajar las reglas duras."""
     updated = schedule_df.copy().reset_index(drop=True)
@@ -385,6 +410,7 @@ def _rebalance_schedule(
                 alerts,
                 continuity_assignments,
                 fill_optional=not mandatory_only,
+                rng=rng,
             )
             if filled:
                 continue
@@ -397,6 +423,7 @@ def _rebalance_schedule(
                     volunteers,
                     turnos_por_grupo,
                     alerts,
+                    rng,
                 )
 
     return updated, alerts
@@ -422,6 +449,7 @@ def _fill_from_available_person(
     alerts: list[str],
     continuity_assignments: dict[tuple[str, int], int],
     fill_optional: bool,
+    rng: random.Random,
 ) -> bool:
     assigned_by_turn, zones_by_person, assigned_turns_by_person = _assignment_state(schedule_df, volunteers)
     candidates = _compatible_candidates(
@@ -457,6 +485,7 @@ def _fill_from_available_person(
         assigned_turns_by_person,
         zones_by_person,
         turnos_por_grupo,
+        rng,
     )
     _set_schedule_assignment(schedule_df, row_index, selected)
 
@@ -482,6 +511,7 @@ def _move_from_optional_refuerzo(
     volunteers: pd.DataFrame,
     turnos_por_grupo: dict[str, list[int]],
     alerts: list[str],
+    rng: random.Random,
 ) -> bool:
     if not bool(target_slot["obligatorio"]):
         return False
@@ -519,16 +549,17 @@ def _move_from_optional_refuerzo(
     if not compatible_donors:
         return False
 
-    compatible_donors.sort(
-        key=lambda item: _rebalance_score(
+    donor_index, donor, volunteer, repeated_zone = _pick_best_by_score(
+        compatible_donors,
+        lambda item: _rebalance_score(
             item[2],
             target_slot,
             assigned_turns_by_person,
             zones_by_person,
             turnos_por_grupo,
-        )
+        ),
+        rng,
     )
-    donor_index, donor, volunteer, repeated_zone = compatible_donors[0]
     _set_schedule_assignment(schedule_df, target_index, volunteer)
     _set_schedule_free(schedule_df, donor_index)
 
@@ -583,6 +614,7 @@ def _select_rebalance_candidate(
     assigned_turns_by_person: dict[int, set[int]],
     zones_by_person: dict[int, list[str]],
     turnos_por_grupo: dict[str, list[int]],
+    rng: random.Random,
 ) -> pd.Series:
     scored = candidates.copy()
     scored["_rebalance_score"] = scored.apply(
@@ -595,7 +627,9 @@ def _select_rebalance_candidate(
         ),
         axis=1,
     )
-    return scored.sort_values(["_rebalance_score", "Estado", "Grupo", "Nombre", "Apellido", "_id"]).iloc[0]
+    best_score = min(scored["_rebalance_score"])
+    best = scored[scored["_rebalance_score"] == best_score]
+    return _pick_random_candidate(best, rng)
 
 
 def _rebalance_score(
