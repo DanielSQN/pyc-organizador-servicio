@@ -246,12 +246,25 @@ def _apply_special_filters(
     turno = int(slot["turno"])
 
     if rule == "spk_base":
+        # Auditorio SPK debe quedar con sus tres mujeres en todos los turnos.
+        # El género es obligatorio; el grupo y la continuidad son preferencias:
+        # si no alcanzan las mujeres del grupo esperado (o la de continuidad ya
+        # no está libre), se completa con otra mujer disponible del turno antes
+        # que dejar el cupo en SIN ASIGNAR.
+        candidates = candidates[candidates["Género"] == "M"]
+
         required_group = _spk_group_for_turn(turno, turnos_por_grupo)
-        candidates = candidates[(candidates["Grupo"] == required_group) & (candidates["Género"] == "M")]
+        same_group = candidates[candidates["Grupo"] == required_group]
+        if not same_group.empty:
+            candidates = same_group
 
         continuity_key = _continuity_key(slot, turnos_por_grupo)
         if continuity_key in continuity_assignments:
-            return candidates[candidates["_id"] == continuity_assignments[continuity_key]]
+            continuity_match = candidates[candidates["_id"] == continuity_assignments[continuity_key]]
+            if not continuity_match.empty:
+                return continuity_match
+
+        return candidates
 
     if rule == "spk_refuerzo":
         if turno == 4:
@@ -1147,11 +1160,17 @@ def _special_rule_validations(
     for _, row in spk.iterrows():
         required_group = _spk_group_for_turn(int(row["Turno"]), turnos_por_grupo)
         if row["Grupo"] != required_group:
+            # El grupo es preferencia: cubrir los tres cupos con mujeres pesa
+            # más que respetar el bloque de grupo, así que se avisa sin marcarlo
+            # como error.
             alerts.append(
                 _format_alert(
-                    "ERROR",
+                    "ADVERTENCIA",
                     row,
-                    f"Requiere grupo {required_group} y se asignó grupo {row['Grupo']}",
+                    (
+                        f"Se esperaba grupo {required_group} y se asignó grupo {row['Grupo']}; "
+                        "no había suficientes mujeres del grupo esperado para cubrir los tres cupos"
+                    ),
                 )
             )
 
@@ -1233,11 +1252,16 @@ def _validate_same_person_pair(
         first_name = _full_name(first.iloc[0])
         second_name = _full_name(second.iloc[0])
         if first_name != second_name:
+            # La continuidad es preferencia: cubrir el cupo pesa más que
+            # mantener a la misma persona cuando no hay quien repita.
             alerts.append(
                 _format_alert(
-                    "ERROR",
+                    "ADVERTENCIA",
                     first.iloc[0],
-                    f"Requiere la misma persona en turnos {first_turn} y {second_turn}",
+                    (
+                        f"Se prefiere la misma persona en turnos {first_turn} y {second_turn}; "
+                        "no fue posible mantener la continuidad con el personal disponible"
+                    ),
                 )
             )
 
