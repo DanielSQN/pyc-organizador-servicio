@@ -218,11 +218,16 @@ Auditorio SPK
 
 Reglas actuales:
 
-- Requiere género M.
-- Requiere 3 personas.
-- En T1 y T2 usa grupo A.
-- En T3 y T4 usa grupo B.
-- Mantiene continuidad por slot entre T1-T2 y T3-T4.
+- Requiere género M. Es obligatorio: nunca se cubre con un hombre.
+- Requiere 3 personas en todos los turnos. Es el requisito duro de la posición.
+- Prefiere grupo A en T1 y T2, y grupo B en T3 y T4.
+- Prefiere continuidad por slot entre T1-T2 y T3-T4.
+- El grupo y la continuidad son preferencias, no bloqueos: si no alcanzan las
+  mujeres del grupo esperado, se completa el cupo con otra mujer disponible del
+  turno y se genera una advertencia. Antes esto dejaba el cupo en `SIN ASIGNAR`.
+- Los turnos 1 y 4 los cubre un solo grupo, así que ahí solo se pueden llenar
+  los tres cupos si hay al menos tres mujeres asignables en ese grupo. Las
+  personas con estado `Z1`/`Z2`/`Z3` son supervisoras y no cuentan para esto.
 
 ### Auditorio SPK refuerzo
 

@@ -235,7 +235,8 @@ Valores validos:
 - Las posiciones criticas se cubren en los cuatro turnos.
 - Las posiciones de refuerzo son obligatorias en los turnos 2 y 3.
 - En los turnos 1 y 4, los refuerzos aparecen como opcionales y pueden quedar como `-- (Libre)` sin generar alerta.
-- `Auditorio SPK` asigna tres mujeres: grupo A en turnos 1 y 2, grupo B en turnos 3 y 4, manteniendo continuidad por slot cuando es posible.
+- `Auditorio SPK` asigna tres mujeres en todos los turnos. Prefiere grupo A en turnos 1 y 2 y grupo B en turnos 3 y 4, manteniendo continuidad por slot; si no hay suficientes mujeres del grupo esperado, completa los tres cupos con otra mujer disponible del turno y avisa con una advertencia, en vez de dejar el cupo `SIN ASIGNAR`.
+- Las personas con estado `Z1`, `Z2` o `Z3` quedan como supervisoras de esa zona y no se asignan a posiciones. Como los turnos 1 y 4 los cubre un solo grupo, `Auditorio SPK` necesita al menos tres mujeres asignables en el grupo que inicia (turno 1) y tres en el que termina (turno 4).
 - `Auditorio SPK (refuerzo)` asigna una mujer del grupo B en turnos 2 y 3.
 - `MEC y baños auditorio` (M) y `MEC y baños (refuerzo)` (H) mantienen continuidad propia: la misma persona se conserva mientras su grupo trabaje esa posición.
 - `Ingreso lobby / puerta principal` y su refuerzo intentan (sin bloquear) que un turno quede con un hombre y una mujer.
